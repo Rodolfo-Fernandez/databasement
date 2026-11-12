@@ -5,6 +5,32 @@
     themes: all;
 }
 
+/* Custom teal/slate palette, overriding daisyUI's built-in light/dark themes
+   in place so the _theme-init.js switcher (which sets data-theme="light|dark")
+   needs no changes. Unspecified daisyUI colors inherit the built-in values. */
+@plugin "daisyui/theme" {
+    name: "light";
+    default: true;
+    color-scheme: light;
+    --color-primary: #0f766e;
+    --color-primary-content: #ffffff;
+    --color-base-100: #ffffff;
+    --color-base-200: #f1f5f9;
+    --color-base-300: #e2e8f0;
+    --color-base-content: #0f172a;
+}
+
+@plugin "daisyui/theme" {
+    name: "dark";
+    color-scheme: dark;
+    --color-primary: #2dd4bf;
+    --color-primary-content: #042f2e;
+    --color-base-100: #0f172a;
+    --color-base-200: #1e293b;
+    --color-base-300: #334155;
+    --color-base-content: #f1f5f9;
+}
+
 @source '../views';
 @source '../../vendor/laravel/framework/src/Illuminate/Pagination/resources/views/*.blade.php';
 @source '../../vendor/robsontenorio/mary/src/View/Components/**/*.php';
@@ -36,4 +62,55 @@
 
 [x-cloak] {
     display: none !important;
+}
+
+/* ---- Layout redesign ---- */
+
+/* Sidebar: slim scrollbar */
+aside {
+    scrollbar-width: thin;
+    scrollbar-color: color-mix(in oklab, var(--color-base-content) 20%, transparent) transparent;
+}
+
+aside::-webkit-scrollbar {
+    width: 6px;
+}
+
+aside::-webkit-scrollbar-thumb {
+    background-color: color-mix(in oklab, var(--color-base-content) 20%, transparent);
+    border-radius: 999px;
+}
+
+aside::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+/* Sidebar section headings */
+.nav-section-title {
+    padding: 1.1rem 0.9rem 0.3rem;
+    font-size: 0.65rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    color: color-mix(in oklab, var(--color-base-content) 45%, transparent);
+    pointer-events: none;
+}
+
+/* Menu rows: tighter radius + pill-style active state */
+.menu li > a {
+    border-radius: 0.6rem;
+    font-weight: 500;
+}
+
+.menu li > a.menu-active,
+.menu li > a.active {
+    background-color: color-mix(in oklab, var(--color-primary) 12%, transparent);
+    color: var(--color-primary);
+    font-weight: 600;
+}
+
+/* Cards: tighter corners, soft elevation */
+.card {
+    border-radius: 1rem;
+    box-shadow: 0 1px 3px rgb(15 23 42 / 0.06), 0 6px 16px rgb(15 23 42 / 0.05);
 }

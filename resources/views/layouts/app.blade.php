@@ -28,7 +28,7 @@
 {{-- MAIN --}}
 <x-main>
     {{-- SIDEBAR --}}
-    <x-slot:sidebar drawer="main-drawer" collapsible class="bg-base-100 lg:bg-inherit">
+    <x-slot:sidebar drawer="main-drawer" collapsible class="bg-base-100 lg:border-e lg:border-base-300">
         <div class="flex flex-col h-full">
             {{-- BRAND --}}
             <x-app-brand class="px-5 pt-4" />
@@ -47,17 +47,22 @@
 
             {{-- MAIN MENU --}}
             <x-menu activate-by-route class="flex-1">
-                <x-menu-separator />
+                <li class="nav-section-title">{{ __('Overview') }}</li>
                 <x-menu-item title="{{ __('Dashboard') }}" icon="o-home" link="{{ route('dashboard') }}" wire:navigate />
+
+                <li class="nav-section-title">{{ __('Data') }}</li>
                 <x-menu-item title="{{ __('Database Servers') }}" icon="o-server-stack" link="{{ route('database-servers.index') }}" wire:navigate />
                 <livewire:menu.snapshots-menu-item />
                 <livewire:menu.restores-menu-item />
                 <x-menu-item title="{{ __('Volumes') }}" icon="o-circle-stack" link="{{ route('volumes.index') }}" wire:navigate />
+
+                <li class="nav-section-title">{{ __('Administration') }}</li>
                 @can('viewAny', \App\Models\User::class)
                     <x-menu-item title="{{ __('Users') }}" icon="o-users" link="{{ route('users.index') }}" wire:navigate />
                 @endcan
                 <livewire:menu.agents-menu-item />
-                <x-menu-separator />
+
+                <li class="nav-section-title">{{ __('System') }}</li>
                 <x-menu-item :title="__('Configuration')" icon="o-cog-6-tooth" :link="route('configuration.application')" wire:navigate />
                 <x-menu-item :title="__('Changelog')" icon="o-newspaper" :link="route('changelog')" wire:navigate />
                 <x-menu-item title="{{ __('API Docs') }}" no-wire-navigate="true" icon="o-document-text" link="{{ route('scramble.docs.ui') }}" />
@@ -100,41 +105,11 @@
         {{ $slot }}
 
         {{-- FOOTER --}}
-        @php
-            $githubRepo = config('app.github_repo');
-            $githubRepoShort = trim(str_replace('https://', '', $githubRepo), '/');
-        @endphp
         <footer class="mt-12 py-6 border-t border-base-300">
-            <div class="flex flex-col items-center gap-4 text-sm text-base-content/60">
-                {{-- Top row: Made by + GitHub --}}
-                <div class="flex flex-col sm:flex-row items-center gap-2 sm:gap-4">
-                    <span>
-                        Made with <span class="text-error">&#10084;</span> by
-                        <a href="https://crty.dev" target="_blank" rel="noopener" class="link link-hover">David-Crty</a>
-                    </span>
-                    <a href="{{ $githubRepo }}" target="_blank" rel="noopener" class="link link-hover flex items-center gap-1">
-                        <x-bi-github class="w-4 h-4" />
-                        {{ $githubRepoShort }}
-                    </a>
-                </div>
-                {{-- Bottom row: Links --}}
-                <div class="flex flex-wrap items-center justify-center gap-x-4 gap-y-2">
-                    <a href="https://david-crty.github.io/databasement/" target="_blank" rel="noopener" class="link link-hover">
-                        Documentation
-                    </a>
-                    <a href="{{ route('changelog') }}" wire:navigate class="link link-hover">
-                        {{ __('Changelog') }}
-                    </a>
-                    <a href="{{ $githubRepo }}/issues/new" target="_blank" rel="noopener" class="link link-hover">
-                        {{ __('Report an issue') }}
-                    </a>
-                    <a href="{{ $githubRepo }}/blob/main/LICENSE" target="_blank" rel="noopener" class="link link-hover">
-                        MIT License
-                    </a>
-                    @persist('version-status')
-                        <livewire:version-status />
-                    @endpersist
-                </div>
+            <div class="flex flex-wrap items-center justify-center gap-x-4 gap-y-2 text-sm text-base-content/60">
+                @persist('version-status')
+                    <livewire:version-status />
+                @endpersist
             </div>
         </footer>
     </x-slot:content>

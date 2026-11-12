@@ -1,76 +1,72 @@
-<p align="center">
-  <a href="https://github.com/David-Crty/databasement">
-    <img src="docs/static/img/banner-v2.png" alt="Databasement Banner" />
-  </a>
-</p>
+<div align="center">
+  <img src="docs/static/img/banner-v2.png" alt="Databasement" width="720">
+</div>
 
-<p align="center">
-  <a href="https://app.codecov.io/gh/David-Crty/databasement">
-    <img src="https://codecov.io/gh/David-Crty/databasement/graph/badge.svg" alt="Code Coverage" />
-  </a>
-  <a href="https://github.com/David-Crty/databasement/actions">
-    <img src="https://github.com/David-Crty/databasement/actions/workflows/tests.yml/badge.svg" alt="CI Status" />
-  </a>
-  <a href="https://artifacthub.io/packages/helm/databasement/databasement">
-    <img src="https://img.shields.io/endpoint?url=https://artifacthub.io/badge/repository/databasement" alt="Artifact Hub" />
-  </a>
-  <a href="https://hub.docker.com/r/davidcrty/databasement">
-    <img src="https://img.shields.io/docker/pulls/davidcrty/databasement" alt="Docker Pulls" />
-  </a>
-  <a href="https://snyk.io/test/github/David-Crty/databasement">
-    <img src="https://snyk.io/test/github/David-Crty/databasement/badge.svg" alt="Known Vulnerabilities" />
-  </a>
-</p>
+# Databasement
 
-<p align="center">
-  A modern, self-hosted database backup management application for MySQL, PostgreSQL, MariaDB, Microsoft SQL Server, MongoDB, SQLite, Firebird, and Redis.
-</p>
+Sistema autoalojado de gestión de copias de seguridad para bases de datos: MySQL, PostgreSQL, MariaDB, SQL Server, MongoDB, SQLite, Firebird y Redis.
 
-<p align="center">
-  <a href="https://databasement-demo.crty.dev/"><strong>Live Demo</strong></a> ·
-  <a href="https://david-crty.github.io/databasement/">Documentation</a> ·
-  <a href="https://david-crty.github.io/databasement/llms.txt">llms.txt</a> ·
-  <a href="https://github.com/David-Crty/databasement/issues">Report Bug or Request Feature</a>
-</p>
+Este repositorio es una bifurcación de trabajo personal del proyecto original [David-Crty/databasement](https://github.com/David-Crty/databasement). Incluye una paleta de colores propia (teal/slate), un menú lateral rediseñado y este README en español.
 
 ---
 
-## Features
+## Estructura del proyecto
 
-- **Multi-database support** - Manage MySQL, PostgreSQL, MariaDB, Microsoft SQL Server, MongoDB, SQLite, Firebird, and Redis/Valkey servers from a single interface
-- **SSH tunnel support** - Connect to databases in private networks through a bastion/jump server with password or key-based authentication
-- **Remote agents** - Back up databases in firewalled or isolated networks with no inbound port: a lightweight agent connects out over HTTPS, dumps locally, and uploads to your storage
-- **Automated backups** - Schedule recurring backups on daily or weekly intervals. Flexible retention policies: simple time-based (days) or GFS (grandfather-father-son)
-- **Multiple compression options** - gzip, zstd (20-40% better compression), or encrypted (AES-256 for sensitive data)
-- **Cross-server restore** - Restore snapshots from production to staging, or between any compatible servers
-- **Scheduled restores** - Refresh a target database on a recurring schedule (e.g. nightly prod → staging) by replaying the latest completed snapshot
-- **Built-in data browser** - Open Adminer in-app to inspect MySQL, PostgreSQL, and SQLite servers (admin-enabled, role-gated)
-- **Flexible storage** - Store backups locally, on S3-compatible storage (AWS S3, MinIO, etc.), Azure Blob Storage, Samba/SMB shares, or remote servers via SFTP/FTP
-- **Real-time monitoring** - Track backup and restore progress with detailed job logs
-- **Failure notifications** - Get alerted via Email, Slack, Discord, Telegram, Pushover, Gotify, or Webhook when jobs fail
-- **Team ready** - Multi-tenant organizations with isolated workspaces, role-based access control, OAuth/SSO login (Google, GitHub, GitLab, OpenID Connect), and optional two-factor authentication
-- **Automation** - REST API and MCP server for scripting, CI/CD, and AI assistant integration
-- **Simple deployment** - Single Docker container with built-in web server, queue worker, and scheduler
+```text
+databasement/
+├── app/
+│   ├── Actions/              # Lógica de negocio por dominio
+│   │   ├── Backups/          # CreateBackupJobAction, RunBackupAction, etc.
+│   │   ├── Restores/         # RestoreAction, ScheduleRestoreAction
+│   │   ├── Snapshots/        # Snapshot lifecycle actions
+│   │   ├── Servers/          # Server CRUD y pruebas de conexión
+│   │   ├── Volumes/          # Volúmenes local/S3/Azure/SMB/SFTP
+│   │   └── Notifications/    # Canales y envío de alertas
+│   ├── Livewire/             # Componentes de interfaz (clase, no Volt)
+│   ├── Models/               # Modelos Eloquent con claves ULID
+│   └── Providers/            # Registro de servicios
+├── config/                   # Configuración Laravel
+├── database/
+│   ├── migrations/           # Esquema
+│   └── seeders/              # Datos iniciales
+├── lang/                     # Traducciones (Backup, Restore y Snapshot en inglés)
+├── resources/
+│   ├── css/app.css           # Tema daisyUI teal/slate personalizado
+│   ├── js/                   # Entry point Vite
+│   └── views/layouts/app.blade.php  # Layout con sidebar rediseñado
+├── routes/                   # Web, API y canales
+├── tests/                    # Suite Pest
+├── docs/                     # Documentación del sitio
+├── docker/                   # Imagen y entrypoint
+└── .github/workflows/        # CI (tests, codecov)
+```
 
-> **Try it out!** Explore the [live demo](https://databasement-demo.crty.dev/) to see Databasement in action before installing.
+## Cómo está realizado
 
-## Self-Hosting
+**Stack**: Laravel 12 sobre PHP 8.5. Interfaz con Livewire 3 y Mary UI sobre daisyUI 5 y Tailwind CSS 4, construida con Vite. Autenticación con Fortify (OAuth Google/GitHub/GitLab/OIDC y 2FA). Autorización con Bouncer (roles, organizaciones y permisos por recurso). Tests con Pest. Documentación de API con Scramble. Claves primarias ULID.
 
-Databasement is designed to be self-hosted. We provide several deployment options:
+**Arquitectura**: patrón Actions, una acción por operación en `App\Actions\<Dominio>\<Verbo><Sujeto>Action`. Livewire de clase (sin Volt). Los agentes de servidor salen por HTTPS hacia la aplicación, sin puertos de entrada. Conexión a bases de datos mediante túneles SSH (bastión, contraseña o clave). Un solo contenedor Docker con queue worker integrado.
 
-| Method                | Description                                  | Guide                                                                                |
-|-----------------------|----------------------------------------------|--------------------------------------------------------------------------------------|
-| **Docker**            | Single container deployment                  | [View Guide](https://david-crty.github.io/databasement/self-hosting/docker)          |
-| **Docker Compose**    | Multi-container setup with external database | [View Guide](https://david-crty.github.io/databasement/self-hosting/docker-compose)  |
-| **Kubernetes + Helm** | For Kubernetes clusters                      | [View Guide](https://david-crty.github.io/databasement/self-hosting/kubernetes-helm) |
-| **Native Ubuntu**     | Traditional installation without Docker      | [View Guide](https://david-crty.github.io/databasement/self-hosting/native-ubuntu)   |
+**Motores soportados**:
 
-### Quick Start
+| Motor | Versiones | Herramienta | Restore |
+| --- | --- | --- | --- |
+| MySQL | 5.5 - 26.x | mysqldump | Sí |
+| MariaDB | 5.x - 12.x | mariadb-dump / mysqldump | Sí |
+| PostgreSQL | 12 - 18 | pg_dump v16 / v18 | Sí |
+| SQL Server | 2017 / 2019 / 2022 / Azure | sqlpackage (.dacpac) | Sí |
+| MongoDB | 4.2 - 8.0 | mongodump / mongorestore | Sí |
+| SQLite | 3.x | sqlite3 .backup | Sí |
+| Firebird | 3.x - 5.x | gbak v5 | Sí |
+| Redis | 2.8+ | redis-cli --rdb | No |
+| Valkey | 7.2+ | redis-cli --rdb | No |
+
+## Cómo se utiliza
+
+### Docker
 
 ```bash
-# Run the container
-docker run -d \
-  --name databasement \
+docker run -d --name databasement \
   -p 2226:2226 \
   -e DB_CONNECTION=sqlite \
   -e DB_DATABASE=/data/database.sqlite \
@@ -79,65 +75,37 @@ docker run -d \
   davidcrty/databasement:1
 ```
 
-Open http://localhost:2226 and create your first admin account.
+Abre `http://localhost:2226`. Usa `PUID`/`PGID` para permisos de archivos.
 
-> **Note:** The container automatically handles volume permissions. You can use `PUID` and `PGID` environment variables to match your system's user/group IDs.
+### Desarrollo local
 
-For production deployments, see our [configuration guide](https://david-crty.github.io/databasement/self-hosting/configuration) for environment variables and best practices.
+```bash
+composer install
+npm install
+cp .env.example .env
+php artisan key:generate
+php artisan migrate
+npm run build
+php artisan serve --port=2226
+```
 
-## Supported Database Versions
+Abre `http://localhost:2226`.
 
-| Engine     | Supported Versions            | CLI Tool                     | Restore |
-|------------|-------------------------------|------------------------------|---------|
-| MySQL      | 5.5, 5.6, 5.7, 8.x, 9.x, 26.x | `mysqldump`                  | Yes     |
-| MariaDB    | 5.x, 10.x, 11.x, 12.x         | `mariadb-dump` / `mysqldump` | Yes     |
-| PostgreSQL | 12, 13, 14, 15, 16, 17, 18    | `pg_dump` v16 / v18          | Yes     |
-| SQL Server | 2017, 2019, 2022, Azure SQL   | `sqlpackage` (`.dacpac`)     | Yes     |
-| MongoDB    | 4.2, 4.4, 5.0, 6.0, 7.0, 8.0  | `mongodump` / `mongorestore` | Yes     |
-| SQLite     | 3.x                           | `sqlite3 .backup`            | Yes     |
-| Firebird   | 3.x, 4.x, 5.x                 | `gbak` v5                    | Yes     |
-| Redis      | 2.8+                          | `redis-cli --rdb`            | No      |
-| Valkey     | 7.2+                          | `redis-cli --rdb`            | No      |
+### Flujo de uso
 
-See the [Database Servers documentation](https://david-crty.github.io/databasement/user-guide/database-servers#supported-versions) for version-specific backup and restore details.
+1. Registra servidores de bases de datos (menú **Data**).
+2. Configura volúmenes de destino: local, S3/MinIO, Azure Blob, SMB o SFTP.
+3. Crea trabajos de **Backup**: diarios o semanales, retención simple o GFS.
+4. Activa compresión (gzip/zstd) y cifrado (AES-256) según necesidad.
+5. Monitorea los **Snapshots** en tiempo real desde la interfaz.
+6. Restaura: entre servidores o programadas (por ejemplo producción a staging).
+7. Configura notificaciones: Email, Slack, Discord, Telegram, Pushover, Gotify o Webhook.
+8. Invita al equipo: usuarios, roles y permisos con Bouncer.
 
-## Automation
+### Automatización
 
-Databasement can be managed programmatically through its **REST API** and **MCP server**, enabling integration with scripts, CI/CD pipelines, and AI assistants.
+API REST documentada en `/docs/api`. Tokens de API en el menú **System**. Servidor MCP disponible para integraciones con asistentes de IA.
 
-- **REST API** - Full API for managing servers, backups, and restores. See the [API documentation](https://david-crty.github.io/databasement/user-guide/api).
-- **MCP Server** - Connect AI assistants (Claude Code, Cursor, VS Code Copilot, etc.) to manage backups through natural language. See the [MCP documentation](https://david-crty.github.io/databasement/user-guide/mcp).
+## Licencia
 
-## Documentation
-
-Full documentation is available at [david-crty.github.io/databasement](https://david-crty.github.io/databasement/).
-
-For LLMs and AI assistants, the documentation is also published in the [llmstxt.org](https://llmstxt.org/) format:
-- [llms.txt](https://david-crty.github.io/databasement/llms.txt) — index of all documentation pages
-- [llms-full.txt](https://david-crty.github.io/databasement/llms-full.txt) — full documentation content in a single file
-
-## Issues & Feature Requests
-
-Found a bug? Please [open an issue](https://github.com/David-Crty/databasement/issues) with reproduction steps.
-
-Have an idea for a new feature? Start a [discussion](https://github.com/David-Crty/databasement/discussions) first so we can evaluate together whether it fits the project scope.
-
-## Contributing
-
-Contributions are welcome! Before submitting a pull request, please:
-
-1. Check existing issues and discussions to avoid duplicates
-2. For significant changes, open an issue first to discuss the approach
-3. Follow the [development guide](https://david-crty.github.io/databasement/contributing/development) for setup instructions
-
-Small fixes (typos, documentation improvements) can be submitted directly as PRs.
-
-AI agent files come from [Laravel Boost](https://github.com/laravel/boost). The Boost section of `CLAUDE.md` and the skills in `.claude/skills/` are regenerated by `composer update` (`php artisan boost:update`), so don't edit them by hand. Custom skills live in `.ai/skills/` and custom guidelines in `.ai/guidelines/`; Boost links them into `.claude/skills/` on the next update.
-
-## Security
-
-If you discover a security vulnerability, please report it responsibly. See [SECURITY.md](SECURITY.md) for details.
-
-## License
-
-Databasement is open-source software licensed under the [MIT License](LICENSE).
+MIT. El proyecto original es de [David-Crty](https://github.com/David-Crty).
