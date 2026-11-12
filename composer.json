@@ -1,0 +1,143 @@
+{
+    "$schema": "https://getcomposer.org/schema.json",
+    "name": "laravel/livewire-starter-kit",
+    "type": "project",
+    "description": "The official Laravel starter kit for Livewire.",
+    "keywords": [
+        "laravel",
+        "framework"
+    ],
+    "license": "MIT",
+    "repositories": [
+        {
+            "type": "package",
+            "package": {
+                "name": "vrana/adminer-compiled",
+                "version": "6.2.0",
+                "dist": {
+                    "url": "https://github.com/vrana/adminer/releases/download/v6.2.0/adminer-6.2.0.php",
+                    "type": "file"
+                }
+            }
+        },
+        {
+            "type": "package",
+            "package": {
+                "name": "vrana/adminer-design-hever",
+                "version": "6.2.0",
+                "dist": {
+                    "url": "https://raw.githubusercontent.com/vrana/adminer/refs/tags/v6.2.0/designs/hever/adminer.css",
+                    "type": "file"
+                }
+            }
+        }
+    ],
+    "require": {
+        "php": "^8.5",
+        "ext-ftp": "*",
+        "ext-mongodb": "*",
+        "ext-pdo": "*",
+        "blade-ui-kit/blade-icons": "^1.8",
+        "codeat3/blade-devicons": "^1.8",
+        "davidhsianturi/blade-bootstrap-icons": "^2.2",
+        "dedoc/scramble": "^0.13.8",
+        "jerodev/flysystem-v3-smb-adapter": "^1.2",
+        "kovah/laravel-socialite-oidc": "^0.8.0",
+        "laravel-notification-channels/discord": "^1.7",
+        "laravel-notification-channels/pushover": "^5.0",
+        "laravel-notification-channels/telegram": "^8.0",
+        "laravel/fortify": "^1.30",
+        "laravel/framework": "^13.0",
+        "laravel/mcp": "^1.1.2",
+        "laravel/sanctum": "^4.2",
+        "laravel/slack-notification-channel": "^3.7",
+        "laravel/socialite": "^5.24",
+        "laravel/tinker": "^3.0",
+        "league/flysystem-aws-s3-v3": "^3.0",
+        "league/flysystem-azure-blob-storage": "^3.0",
+        "league/flysystem-ftp": "^3.31",
+        "league/flysystem-sftp-v3": "^3.31",
+        "livewire/livewire": "^4.0",
+        "lorisleiva/cron-translator": "^0.5.0",
+        "lorisleiva/laravel-actions": "^2.12",
+        "mongodb/mongodb": "^2.2",
+        "robsontenorio/mary": "^2.4",
+        "silber/bouncer": "^1.0",
+        "spatie/laravel-query-builder": "^7.2",
+        "vrana/adminer-compiled": "6.2.0",
+        "vrana/adminer-design-hever": "6.2.0"
+    },
+    "require-dev": {
+        "ext-zlib": "*",
+        "barryvdh/laravel-ide-helper": "^3.6",
+        "fakerphp/faker": "^1.23",
+        "kargnas/laravel-ai-translator": "^1.7",
+        "kkomelin/laravel-translatable-string-exporter": "^1.26",
+        "larastan/larastan": "^3.8",
+        "laravel/boost": "^2.1",
+        "laravel/pail": "^1.2.2",
+        "laravel/pao": "^1.1",
+        "laravel/pint": "^1.18",
+        "laravel/sail": "^1.41",
+        "mockery/mockery": "^1.6",
+        "nunomaduro/collision": "^8.6",
+        "pestphp/pest": "^5.0",
+        "pestphp/pest-plugin-agent": "^5.0",
+        "pestphp/pest-plugin-laravel": "^5.0",
+        "pestphp/pest-plugin-phpstan": "^5.0",
+        "phpstan/phpstan": "^2.1",
+        "rector/rector": "^2.2"
+    },
+    "autoload": {
+        "psr-4": {
+            "App\\": "app/",
+            "Database\\Factories\\": "database/factories/",
+            "Database\\Seeders\\": "database/seeders/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Tests\\": "tests/"
+        }
+    },
+    "scripts": {
+        "setup": [
+            "composer install",
+            "@php artisan migrate --force"
+        ],
+        "test": [
+            "@php artisan config:clear --ansi",
+            "@php artisan test"
+        ],
+        "post-autoload-dump": [
+            "Illuminate\\Foundation\\ComposerScripts::postAutoloadDump",
+            "@php artisan package:discover --ansi"
+        ],
+        "post-update-cmd": [
+            "@php artisan vendor:publish --tag=laravel-assets --ansi --force",
+            "@php artisan boost:update --ansi"
+        ],
+        "pre-package-uninstall": [
+            "Illuminate\\Foundation\\ComposerScripts::prePackageUninstall"
+        ]
+    },
+    "extra": {
+        "laravel": {
+            "dont-discover": []
+        }
+    },
+    "config": {
+        "optimize-autoloader": true,
+        "preferred-install": "dist",
+        "sort-packages": true,
+        "allow-plugins": {
+            "pestphp/pest-plugin": true,
+            "php-http/discovery": true
+        },
+        "audit": {
+            "ignore": ["PKSA-365x-2zjk-pt47"]
+        }
+    },
+    "minimum-stability": "stable",
+    "prefer-stable": true
+}

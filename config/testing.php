@@ -1,0 +1,92 @@
+<?php
+
+return [
+    /*
+    |--------------------------------------------------------------------------
+    | Test Database Connections
+    |--------------------------------------------------------------------------
+    |
+    | Configuration for external database connections used in automated tests.
+    | These databases are used for integration tests that require real
+    | database connections (e.g., backup/restore tests).
+    |
+    | Default values match the Docker Compose services configuration.
+    |
+    */
+
+    'databases' => [
+        'mysql' => [
+            'host' => env('TEST_MYSQL_HOST', 'mysql'),
+            'port' => env('TEST_MYSQL_PORT', 3306),
+            'username' => env('TEST_MYSQL_USERNAME', 'root'),
+            'password' => env('TEST_MYSQL_PASSWORD', 'root'),
+            'database' => env('TEST_MYSQL_DATABASE', 'databasement_test'),
+        ],
+
+        'mariadb' => [
+            'host' => env('TEST_MARIADB_HOST', 'mariadb'),
+            'port' => env('TEST_MARIADB_PORT', 3306),
+            'username' => env('TEST_MARIADB_USERNAME', 'root'),
+            'password' => env('TEST_MARIADB_PASSWORD', 'root'),
+            'database' => env('TEST_MARIADB_DATABASE', 'databasement_test'),
+        ],
+
+        'postgres' => [
+            'host' => env('TEST_POSTGRES_HOST', 'postgres'),
+            'port' => env('TEST_POSTGRES_PORT', 5432),
+            'username' => env('TEST_POSTGRES_USERNAME', 'root'),
+            'password' => env('TEST_POSTGRES_PASSWORD', 'root'),
+            'database' => env('TEST_POSTGRES_DATABASE', 'databasement_test'),
+        ],
+
+        'redis' => [
+            'host' => env('TEST_REDIS_HOST', 'redis'),
+            'port' => env('TEST_REDIS_PORT', 6379),
+            'password' => env('TEST_REDIS_PASSWORD', null),
+        ],
+
+        'mongodb' => [
+            'host' => env('TEST_MONGODB_HOST', 'mongodb'),
+            'port' => env('TEST_MONGODB_PORT', 27017),
+            'username' => env('TEST_MONGODB_USERNAME', 'root'),
+            'password' => env('TEST_MONGODB_PASSWORD', 'root'),
+            'database' => env('TEST_MONGODB_DATABASE', 'databasement_test'),
+            'auth_source' => env('TEST_MONGODB_AUTH_SOURCE', 'admin'),
+        ],
+
+        'mssql' => [
+            'host' => env('TEST_MSSQL_HOST', 'mssql'),
+            'port' => env('TEST_MSSQL_PORT', 1433),
+            'username' => env('TEST_MSSQL_USERNAME', 'sa'),
+            'password' => env('TEST_MSSQL_PASSWORD', 'Databasement!Strong1'),
+            'database' => env('TEST_MSSQL_DATABASE', 'databasement_test'),
+        ],
+
+        'firebird' => [
+            'database' => env('TEST_FIREBIRD_DATABASE', '/var/lib/firebird/data/databasement_test.fdb'),
+            'password' => env('TEST_FIREBIRD_PASSWORD', 'masterkey'),
+            'username' => env('TEST_FIREBIRD_USERNAME', 'SYSDBA'),
+            'port' => env('TEST_FIREBIRD_PORT', 3050),
+            'host' => env('TEST_FIREBIRD_HOST', 'firebird'),
+        ],
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | SSH Tunnel Test Configuration
+    |--------------------------------------------------------------------------
+    |
+    | Configuration for the SSH server used in SSH tunnel integration tests.
+    | The SSH container can reach other Docker services by their service names,
+    | so mysql_host is the hostname of MySQL as seen from the SSH container.
+    |
+    */
+
+    'ssh' => [
+        'host' => env('TEST_SSH_HOST', 'ssh'),
+        'port' => (int) env('TEST_SSH_PORT', 2222),
+        'username' => env('TEST_SSH_USERNAME', 'testuser'),
+        'password' => env('TEST_SSH_PASSWORD', 'testpass'),
+        'mysql_host' => env('TEST_SSH_MYSQL_HOST', 'mysql'),
+    ],
+];

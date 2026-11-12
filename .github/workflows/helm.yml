@@ -1,0 +1,83 @@
+name: Helm Chart
+
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Helm
+        run: curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+      - name: Helm lint
+        run: helm lint helm/databasement/
+
+      - name: Install helm-unittest plugin
+        run: helm plugin install https://github.com/helm-unittest/helm-unittest.git
+
+      - name: Run helm unittest
+        run: helm unittest helm/databasement/
+
+  release:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Install Helm
+        run: curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+      - name: Extract version from tag
+        id: version
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Patch Chart.yaml and values.yaml with release version
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          sed -i "s/^version:.*/version: ${VERSION}/" helm/databasement/Chart.yaml
+          sed -i "s/^appVersion:.*/appVersion: \"${VERSION}\"/" helm/databasement/Chart.yaml
+          sed -i 's/^  tag:.*/  tag: "'"${VERSION}"'"/' helm/databasement/values.yaml
+
+      - name: Package Helm chart
+        run: |
+          mkdir -p .cr-release-packages
+          helm package helm/databasement/ -d .cr-release-packages/
+
+      - name: Publish Helm chart to GitHub Pages
+        run: |
+          # Configure git
+          git config user.name "$GITHUB_ACTOR"
+          git config user.email "$GITHUB_ACTOR@users.noreply.github.com"
+
+          # Checkout gh-pages branch into a temp directory
+          git fetch origin gh-pages
+          TMPDIR=$(mktemp -d)
+          git worktree add "$TMPDIR" gh-pages
+
+          # Copy the packaged chart and update root index
+          mkdir -p "$TMPDIR/charts"
+          cp .cr-release-packages/*.tgz "$TMPDIR/charts/"
+          helm repo index "$TMPDIR" --url https://david-crty.github.io/databasement --merge "$TMPDIR/index.yaml"
+
+          # Commit and push
+          cd "$TMPDIR"
+          git add charts/ index.yaml
+          git commit -m "Release Helm chart ${{ steps.version.outputs.version }}"
+          git push origin gh-pages
+
+          # Cleanup worktree
+          cd -
+          git worktree remove "$TMPDIR"

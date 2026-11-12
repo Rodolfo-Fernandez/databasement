@@ -1,0 +1,378 @@
+<x-modal wire:model="showLogsModal" @close="$wire.closeLogs()" :title="__('Job Logs')" class="backdrop-blur" box-class="w-11/12 max-w-6xl">
+    @if($this->selectedJob)
+        <div class="space-y-4" x-data="{ showMetadata: false }">
+            @php
+                $triggeredBy = $this->selectedJob->snapshot?->triggeredBy ?? $this->selectedJob->restore?->triggeredBy;
+                $snapshot = $this->selectedJob->snapshot ?? $this->selectedJob->restore?->snapshot;
+
+                // Detect cross-org context: the related server's organization
+                // differs from the user's current organization. The relations
+                // were loaded with withoutGlobalScopes so the data is present
+                // even when scoped queries would normally exclude it.
+                $jobOrgId = $snapshot?->databaseServer->organization_id
+                    ?? $this->selectedJob->restore?->targetServer->organization_id;
+                $currentOrgId = app(\App\Services\CurrentOrganization::class)->id();
+                $crossOrg = ($jobOrgId && $jobOrgId !== $currentOrgId)
+                    ? \App\Models\Organization::find($jobOrgId)
+                    : null;
+            @endphp
+
+            @if($crossOrg)
+                <x-alert class="alert-warning" icon="o-information-circle">
+                    {{ __('This job belongs to a different organization:') }}
+                    <span class="font-semibold">{{ $crossOrg->name }}</span>
+                </x-alert>
+            @endif
+
+            <!-- Job Info Header -->
+            <div class="p-4 bg-base-200 rounded-lg space-y-2">
+                {{-- Mobile: stacked layout, Desktop: horizontal --}}
+                <div class="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                    {{-- Left: Icon + Job info --}}
+                    <div class="flex items-center gap-3">
+                        @if($this->selectedJob->snapshot)
+                            <x-icon :name="$this->selectedJob->snapshot->database_type->icon()" class="w-6 h-6 shrink-0" />
+                        @elseif($this->selectedJob->restore?->snapshot)
+                            <x-icon :name="$this->selectedJob->restore->snapshot->database_type->icon()" class="w-6 h-6 shrink-0" />
+                        @endif
+                        <div class="min-w-0">
+                            <div class="text-sm text-base-content/70">
+                                {{ $this->selectedJob->snapshot ? __('Backup') : __('Restore') }}
+                                @if($snapshot)
+                                    <div class="badge">
+                                        # {{ $snapshot->id }}
+                                    </div>
+                                @endif
+                            </div>
+                            <div class="font-semibold truncate">
+                                @if($this->selectedJob->snapshot)
+                                    {{ $this->selectedJob->snapshot->databaseServer->name }} / {{ $this->selectedJob->snapshot->database_name }}
+                                @elseif($this->selectedJob->restore)
+                                    {{ $this->selectedJob->restore->targetServer->name }} / {{ $this->selectedJob->restore->schema_name }}
+                                @endif
+                            </div>
+                        </div>
+                    </div>
+                    {{-- Right: Status + Metadata button --}}
+                    <div class="flex items-center gap-2 sm:gap-4">
+                        <x-job-status-indicator :status="$this->selectedJob->status" />
+                        @include('partials.cancel-job-button', ['job' => $this->selectedJob, 'label' => __('Cancel job')])
+                        @if($snapshot?->metadata)
+                            <x-button
+                                :label="__('Metadata')"
+                                icon="o-document-text"
+                                class="btn-ghost btn-sm"
+                                x-on:click="showMetadata = !showMetadata"
+                                ::class="showMetadata && 'btn-active'"
+                            />
+                        @endif
+                    </div>
+                </div>
+
+                {{-- Command heartbeat: counted live in the browser between page refreshes --}}
+                @if($this->selectedJob->status === \App\Enums\BackupJobStatus::Running && $this->selectedJob->command_heartbeat_at)
+                    <div
+                        wire:key="command-heartbeat-{{ $this->selectedJob->command_heartbeat_at->getTimestamp() }}"
+                        x-data="{
+                            ageAtRender: {{ (int) max(0, $this->selectedJob->command_heartbeat_at->diffInSeconds(now())) }},
+                            renderedAt: Date.now(),
+                            now: Date.now(),
+                            timer: null,
+                            init() { this.timer = setInterval(() => this.now = Date.now(), 1000) },
+                            destroy() { clearInterval(this.timer) },
+                            get seconds() { return this.ageAtRender + Math.floor((this.now - this.renderedAt) / 1000) },
+                            get stale() { return this.seconds >= {{ \App\Models\BackupJob::COMMAND_HEARTBEAT_WARNING_SECONDS }} },
+                            get ago() {
+                                const format = new Intl.RelativeTimeFormat(document.documentElement.lang || undefined, { numeric: 'auto' });
+                                return this.seconds < 60 ? format.format(-this.seconds, 'second') : format.format(-Math.floor(this.seconds / 60), 'minute');
+                            },
+                        }"
+                    >
+                        <div x-show="!stale" class="flex items-center gap-2 text-sm text-base-content/70">
+                            <x-loading class="loading-dots loading-xs text-success" />
+                            <span>{{ __('Command running, last heartbeat') }} <span x-text="ago"></span></span>
+                        </div>
+                        <x-alert x-show="stale" x-cloak class="alert-warning" icon="o-exclamation-triangle">
+                            <span>{{ __('Last heartbeat from the running command:') }} <span x-text="ago"></span>. {{ __('The worker or agent running it may have stopped.') }}</span>
+                            @if($this->selectedJob->snapshot?->databaseServer?->agent_id)
+                                <span class="opacity-80">
+                                    {{ __('This backup is retried automatically after :minutes minutes without a heartbeat.', ['minutes' => intdiv(\App\Console\Commands\RecoverStuckJobsCommand::COMMAND_HEARTBEAT_STALE_SECONDS, 60)]) }}
+                                </span>
+                            @endif
+                        </x-alert>
+                    </div>
+                @endif
+
+                {{-- File missing warning --}}
+                @if($snapshot && $snapshot->hasMissingFile())
+                    @php $lastVerifiedAt = $snapshot->lastVerifiedAt(); @endphp
+                    <x-alert class="alert-warning" icon="o-exclamation-triangle">
+                        {{ __('Backup file is missing from volume') }}
+                        @if($lastVerifiedAt)
+                            <span class="text-base-content/70">
+                                — {{ __('Last checked') }} {{ \App\Support\Formatters::humanDate($lastVerifiedAt) }} ({{ $lastVerifiedAt->diffForHumans() }})
+                            </span>
+                        @endif
+                    </x-alert>
+                @endif
+
+                {{-- Compression and Volume badges --}}
+                @if($snapshot)
+                    <div class="flex flex-wrap items-center gap-2 pt-1">
+                        {{-- Compression Type --}}
+                        @if($snapshot->compression_type)
+                            <div class="badge badge-outline gap-1.5">
+                                <x-icon :name="$snapshot->compression_type->icon()" class="w-3.5 h-3.5" />
+                                {{ $snapshot->compression_type->label() }}
+                            </div>
+                        @endif
+
+                        {{-- Volume Type(s) --}}
+                        @foreach($snapshot->files as $file)
+                            @if($file->volume)
+                                <x-volume-type-badge :volume="$file->volume" class="badge-outline gap-1.5" />
+                            @endif
+                        @endforeach
+
+                        {{-- Agent: only for backup jobs that ran through a remote agent --}}
+                        @if($this->selectedJob->snapshot?->getAgentName())
+                            <div class="badge badge-outline gap-1.5">
+                                <x-icon name="o-cpu-chip" class="w-3.5 h-3.5" />
+                                {{ __('Agent') }}: {{ $this->selectedJob->snapshot->getAgentName() }}
+                            </div>
+                        @endif
+                    </div>
+                @endif
+                <div class="text-xs sm:text-sm text-base-content/70">
+                    @if($this->selectedJob->started_at)
+                        {{ __('Started') }}: {{ \App\Support\Formatters::humanDate($this->selectedJob->started_at) }}
+                        @if($this->selectedJob->completed_at)
+                            <span class="hidden sm:inline">|</span>
+                            <br class="sm:hidden">
+                            {{ __('Duration') }}: {{ $this->selectedJob->getHumanDuration() }}
+                        @endif
+                        <span class="hidden sm:inline">|</span>
+                        <br class="sm:hidden">
+                    @endif
+                    @if($triggeredBy)
+                        {{ __('By') }}: {{ $triggeredBy->name }}
+                    @endif
+                </div>
+            </div>
+
+            <!-- Metadata Panel -->
+            @if($snapshot?->metadata)
+                <div x-show="showMetadata" x-collapse>
+                    <div class="p-4 bg-base-300 rounded-lg">
+                        <pre class="text-xs font-mono whitespace-pre-wrap overflow-x-auto">{{ json_encode($snapshot->metadata, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) }}</pre>
+                    </div>
+                </div>
+            @endif
+
+            <!-- Logs Table -->
+            @php
+                $logs = $this->selectedJob->getLogs();
+            @endphp
+
+            @if(count($logs) > 0)
+                <div class="border border-base-300 rounded-lg overflow-hidden">
+                    <!-- Table Header (hidden on mobile) -->
+                    <div class="hidden sm:flex bg-base-200 text-sm font-semibold border-b border-base-300">
+                        <div class="w-36 flex-shrink-0 px-4 py-3">{{ __('Date') }}</div>
+                        <div class="w-24 flex-shrink-0 py-3 text-center">{{ __('Type') }}</div>
+                        <div class="flex-1 px-4 py-3">{{ __('Message') }}</div>
+                    </div>
+
+                    <!-- Logs Container -->
+                    <div class="max-h-[60vh] overflow-y-auto divide-y divide-base-300">
+                        @foreach($logs as $index => $log)
+                            @php
+                                $timestamp = \Carbon\Carbon::parse($log['timestamp'])
+                                    ->setTimezone(config('app.display_timezone'));
+                                $isCommand = $log['type'] === 'command';
+                                $isRunning = $isCommand && ($log['status'] ?? null) === 'running';
+
+                                // Determine visual state via pattern matching
+                                $rowState = match(true) {
+                                    $isRunning => 'warning',
+                                    $isCommand && isset($log['exit_code']) && $log['exit_code'] !== 0 => 'error',
+                                    $isCommand && isset($log['exit_code']) && $log['exit_code'] === 0 => 'success',
+                                    !$isCommand => $log['level'] ?? 'info',
+                                    default => 'info',
+                                };
+
+                                $isError = $rowState === 'error';
+                                $isWarning = $rowState === 'warning';
+                                $isSuccess = $rowState === 'success';
+
+                                $logLevel = $isCommand ? 'command' : ($log['level'] ?? 'info');
+                                $hasDetails = $isCommand || !empty($log['context']) || $isError;
+
+                                // Badge styling based on log level (used in multiple places)
+                                $badgeClass = match($logLevel) {
+                                    'error' => 'badge-error badge-sm',
+                                    'warning' => 'badge-warning badge-sm',
+                                    'success' => 'badge-success badge-sm',
+                                    'command' => 'badge-neutral badge-sm',
+                                    default => 'badge-info badge-sm',
+                                };
+
+                                // Row border color based on state
+                                $borderClass = match(true) {
+                                    $isError => 'border-l-error bg-error/5',
+                                    $isWarning => 'border-l-warning',
+                                    $isSuccess => 'border-l-success',
+                                    default => 'border-l-info',
+                                };
+                            @endphp
+
+
+                            <div class="flex border-l-4 {{ $borderClass }}">
+                                <x-collapse
+                                    :collapse-plus-minus="$hasDetails"
+                                    :no-icon="!$hasDetails"
+                                    class="flex-1 rounded-none border-none {{ !$hasDetails ? '[&_.collapse-content]:!p-0 pointer-events-none' : '' }}"
+                                >
+                                    <x-slot:heading>
+                                        {{-- Mobile: timestamp+badge / message, Desktop: timestamp | badge | message --}}
+                                        <div class="flex flex-col gap-1 sm:flex-row sm:items-center w-full -ml-4 {{ !$hasDetails ? 'pointer-events-auto cursor-default' : '' }}">
+                                            {{-- Timestamp --}}
+                                            <div class="sm:w-36 flex-shrink-0 px-4 flex items-center gap-2">
+                                                <span class="font-mono text-xs sm:text-sm text-base-content/70 whitespace-nowrap">
+                                                    {{ $timestamp->format('H:i:s') }}
+                                                    <span class="sm:hidden text-base-content/50">· {{ $timestamp->format('M d') }}</span>
+                                                    <span class="hidden sm:inline">{{ $timestamp->format(' M d') }}</span>
+                                                </span>
+                                                {{-- Badge on mobile only --}}
+                                                <span class="sm:hidden">
+                                                    <x-badge :value="ucfirst($logLevel)" class="{{ $badgeClass }}" />
+                                                </span>
+                                            </div>
+                                            {{-- Badge (desktop only, fixed width for alignment) --}}
+                                            <div class="hidden sm:block w-24 flex-shrink-0 ml-2">
+                                                <span class="inline-flex w-full">
+                                                    <x-badge :value="ucfirst($logLevel)" class="{{ $badgeClass }}" />
+                                                    @if($isRunning)
+                                                        <x-loading class="loading-spinner loading-xs text-warning ml-1" />
+                                                    @endif
+                                                </span>
+                                            </div>
+                                            {{-- Message --}}
+                                            <div class="flex-1 px-4 pr-2 sm:pr-4 min-w-0 overflow-hidden">
+                                                @if($isCommand)
+                                                    <code class="bg-neutral text-neutral-content px-2 py-1 rounded text-xs font-mono truncate block">
+                                                        <span class="text-success">$</span> {{ $log['command'] }}
+                                                    </code>
+                                                @else
+                                                    <span class="text-sm truncate block {{ $isError ? 'text-error' : '' }}">
+                                                        {{ $log['message'] }}
+                                                    </span>
+                                                @endif
+                                            </div>
+                                        </div>
+                                    </x-slot:heading>
+
+                                    <x-slot:content>
+                                        @if($hasDetails)
+                                            <div class="py-3 space-y-3">
+                                                @if($isCommand)
+                                                    <!-- Command & Output -->
+                                                    @php
+                                                        // Same bounded head-and-tail logic ShellProcessor uses when
+                                                        // capturing, on a tighter budget: every line rendered here is a
+                                                        // DOM node that also rides along in the Livewire payload.
+                                                        $rendered = new \App\Services\Backup\OutputBuffer(4096, 4096);
+                                                        $rendered->append(trim($log['output'] ?? ''));
+                                                        $renderedOutput = $rendered->toString();
+                                                        $outputLines = $renderedOutput === '' ? [] : explode("\n", $renderedOutput);
+                                                        $truncationMarker = $rendered->marker();
+                                                    @endphp
+                                                    <div class="mockup-code text-sm max-h-64 overflow-auto">
+                                                        <pre data-prefix="$"><code>{{ $log['command'] }}</code></pre>
+                                                        @foreach($outputLines as $line)
+                                                            @if($line === $truncationMarker)
+                                                                <pre data-prefix="…"><code class="text-warning">{{ $line }}</code></pre>
+                                                            @else
+                                                                <pre data-prefix=">"><code class="{{ $isError ? 'text-error' : '' }}">{{ $line }}</code></pre>
+                                                            @endif
+                                                        @endforeach
+                                                    </div>
+
+                                                    @if($isRunning || isset($log['exit_code']) || isset($log['duration_ms']))
+                                                        <div class="flex items-center gap-2">
+                                                            @if($isRunning)
+                                                                <div class="badge badge-warning badge-sm gap-1">
+                                                                    <x-loading class="loading-spinner loading-xs" />
+                                                                    {{ __('Running') }}
+                                                                </div>
+                                                            @elseif(isset($log['exit_code']))
+                                                                <span class="text-xs text-base-content/50">{{ __('Exit code') }}:</span>
+                                                                <x-badge
+                                                                    :value="$log['exit_code']"
+                                                                    :class="$log['exit_code'] === 0 ? 'badge-success badge-sm' : 'badge-error badge-sm'"
+                                                                />
+                                                            @endif
+                                                            @if(isset($log['duration_ms']))
+                                                                <span class="text-xs text-base-content/50">{{ __('Duration') }}:</span>
+                                                                <span class="text-xs text-base-content/80">{{ \App\Support\Formatters::humanDuration($log['duration_ms']) }}</span>
+                                                            @endif
+                                                        </div>
+                                                    @endif
+                                                @else
+                                                    <!-- Full Message -->
+                                                    <div>
+                                                        <div class="text-xs text-base-content/50 mb-1">{{ __('Message') }}</div>
+                                                        <div class="bg-base-300 p-3 rounded text-sm overflow-x-auto {{ $isError ? 'text-error' : '' }}">
+                                                            {{ $log['message'] }}
+                                                        </div>
+                                                    </div>
+                                                    @if(isset($log['context']) && !empty($log['context']))
+                                                        <div>
+                                                            <div class="text-xs text-base-content/50 mb-1">{{ __('Context') }}</div>
+                                                            <div class="bg-base-300 p-3 rounded font-mono text-xs overflow-x-auto">
+                                                                <pre class="text-base-content/80">{{ json_encode($log['context'], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) }}</pre>
+                                                            </div>
+                                                        </div>
+                                                    @endif
+                                                @endif
+                                            </div>
+                                        @endif
+                                    </x-slot:content>
+                                </x-collapse>
+                            </div>
+                        @endforeach
+                    </div>
+                </div>
+            @else
+                <div class="text-center py-8 text-base-content/50">
+                    <x-icon name="o-document-text" class="w-12 h-12 mx-auto mb-2 opacity-50" />
+                    <div>{{ __('No logs available for this job.') }}</div>
+                </div>
+            @endif
+        </div>
+
+        <x-slot:actions>
+            <x-button :label="__('Close')" @click="$wire.showLogsModal = false" />
+        </x-slot:actions>
+    @endif
+</x-modal>
+
+<x-confirm-modal
+    model="showCancelJobModal"
+    :title="__('Cancel Job')"
+    :message="__('The job stops at its next step, or within 30 seconds while a command runs.')"
+    on-confirm="cancelJob"
+    :confirm-label="__('Cancel job')"
+    :cancel-label="__('Keep running')"
+>
+    @if($cancelJobRestoreTarget)
+        <x-alert icon="o-exclamation-triangle" class="alert-warning mt-4">
+            <div class="space-y-1">
+                <div class="font-semibold">{{ __('The target database may be left unusable: :target', ['target' => $cancelJobRestoreTarget]) }}</div>
+                <div>{{ __('Once the restore has started loading data, the previous content of this database is already gone. Cancelling then leaves it partially restored, with only some of its tables and rows. Run a restore again to get a usable database.') }}</div>
+            </div>
+        </x-alert>
+    @else
+        <p class="mt-2 text-sm opacity-80">{{ __('The source database is not affected: the dump only reads it, and its partial file is discarded.') }}</p>
+    @endif
+</x-confirm-modal>

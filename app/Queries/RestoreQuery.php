@@ -1,0 +1,105 @@
+<?php
+
+namespace App\Queries;
+
+use App\Models\Restore;
+use App\Queries\Concerns\OrdersByJobStatus;
+use App\Support\Formatters;
+use Illuminate\Database\Eloquent\Builder;
+
+class RestoreQuery
+{
+    use OrdersByJobStatus;
+
+    private const ALLOWED_SORT_COLUMNS = [
+        'created_at',
+        'status',
+        'duration_ms',
+    ];
+
+    /**
+     * `job` is loaded without its `logs` blob: the listing only needs the status.
+     * The logs modal re-fetches the job in full.
+     *
+     * @return array<int|string, mixed>
+     */
+    private static function relationships(): array
+    {
+        return [
+            'snapshot.databaseServer',
+            'targetServer',
+            'triggeredBy',
+            'scheduledRestore',
+            'job' => fn ($query) => $query->withoutLogs(),
+        ];
+    }
+
+    /**
+     * Build query from manual parameters (for Livewire).
+     *
+     * @return Builder<Restore>
+     */
+    public static function buildFromParams(
+        ?string $search = null,
+        string $statusFilter = 'all',
+        ?string $sourceServerFilter = null,
+        ?string $targetServerFilter = null,
+        ?string $dbTypeFilter = null,
+        string $sortColumn = 'created_at',
+        string $sortDirection = 'desc'
+    ): Builder {
+        $query = Restore::query()
+            ->with(self::relationships());
+
+        $query
+            ->when($search, function (Builder $query) use ($search) {
+                self::applySearch($query, $search);
+            })
+            ->when($statusFilter !== 'all' && $statusFilter !== '', function (Builder $query) use ($statusFilter) {
+                $query->whereHas('job', fn (Builder $q) => $q->whereRaw('status = ?', [$statusFilter]));
+            })
+            ->when($sourceServerFilter, function (Builder $query) use ($sourceServerFilter) {
+                $query->whereHas('snapshot', fn (Builder $q) => $q->whereRaw('database_server_id = ?', [$sourceServerFilter]));
+            })
+            ->when($targetServerFilter, function (Builder $query) use ($targetServerFilter) {
+                $query->whereRaw('target_server_id = ?', [$targetServerFilter]);
+            })
+            ->when($dbTypeFilter, function (Builder $query) use ($dbTypeFilter) {
+                $query->whereHas('snapshot', fn (Builder $q) => $q->whereRaw('database_type = ?', [$dbTypeFilter]));
+            });
+
+        $direction = Formatters::sortDirection($sortDirection);
+        $sortColumn = Formatters::sortColumn($sortColumn, self::ALLOWED_SORT_COLUMNS);
+
+        if ($sortColumn === 'status') {
+            return self::orderByJobStatus($query, 'restores.backup_job_id', $direction);
+        }
+
+        if ($sortColumn === 'duration_ms') {
+            return self::orderByJobDuration($query, 'restores.backup_job_id', $direction);
+        }
+
+        return $query->orderBy($sortColumn, $direction);
+    }
+
+    /**
+     * @param  Builder<Restore>  $query
+     */
+    private static function applySearch(Builder $query, string $search): void
+    {
+        $query->where(function (Builder $q) use ($search) {
+            $q->whereHas('targetServer', function (Builder $sq) use ($search) {
+                $sq->whereRaw('name LIKE ?', ["%{$search}%"]);
+            })
+                ->orWhereHas('snapshot.databaseServer', function (Builder $sq) use ($search) {
+                    $sq->whereRaw('name LIKE ?', ["%{$search}%"]);
+                })
+                ->orWhereHas('snapshot', function (Builder $sq) use ($search) {
+                    $sq->whereRaw('database_name LIKE ?', ["%{$search}%"]);
+                })
+                ->orWhereRaw('schema_name LIKE ?', ["%{$search}%"])
+                ->orWhereRaw('id LIKE ?', ["%{$search}%"])
+                ->orWhereRaw('snapshot_id LIKE ?', ["%{$search}%"]);
+        });
+    }
+}

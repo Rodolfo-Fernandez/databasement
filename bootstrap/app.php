@@ -1,0 +1,125 @@
+<?php
+
+use App\Facades\AppConfig;
+use App\Models\BackupSchedule;
+use App\Models\ScheduledRestore;
+use Dotenv\Dotenv;
+use Illuminate\Console\Scheduling\Schedule;
+use Illuminate\Database\QueryException;
+use Illuminate\Foundation\Application;
+use Illuminate\Foundation\Configuration\Exceptions;
+use Illuminate\Foundation\Configuration\Middleware;
+use Symfony\Component\HttpFoundation\Request;
+
+if (! defined('TRUSTED_PROXIES_DEFAULT')) {
+    define('TRUSTED_PROXIES_DEFAULT', '127.0.0.0/8,10.0.0.0/8,100.64.0.0/10,169.254.0.0/16,172.16.0.0/12,192.168.0.0/16');
+}
+
+if (file_exists(dirname(__DIR__).'/.env.local')) {
+    $dotenv = Dotenv::createImmutable(dirname(__DIR__), '.env.local');
+    $dotenv->load();
+}
+
+// Load extra env file if specified (useful for testing with different databases)
+$extraEnvFile = getenv('EXTRA_ENV_FILE');
+if ($extraEnvFile && file_exists(dirname(__DIR__).'/'.$extraEnvFile)) {
+    $dotenv = Dotenv::createMutable(dirname(__DIR__), $extraEnvFile);
+    $dotenv->load();
+}
+
+return Application::configure(basePath: dirname(__DIR__))
+    ->withRouting(
+        web: __DIR__.'/../routes/web.php',
+        api: __DIR__.'/../routes/api.php',
+        commands: __DIR__.'/../routes/console.php',
+        health: '/up',
+    )
+    // Runs only when the scheduler is resolved (schedule:run, schedule:list, ...),
+    // so other commands do not read the database while booting.
+    ->withSchedule(function (Schedule $schedule) {
+        // Register backup schedules dynamically from the database
+        try {
+            foreach (BackupSchedule::all() as $backupSchedule) {
+                $schedule->command('backups:run', [$backupSchedule->id])
+                    ->cron($backupSchedule->expression);
+            }
+        } catch (QueryException) {
+            // Table may not exist yet (pre-migration)
+        }
+
+        // Register scheduled restores dynamically from the database
+        try {
+            foreach (ScheduledRestore::where('enabled', true)->with('backupSchedule')->get() as $scheduledRestore) {
+                $schedule->command('restores:run', [$scheduledRestore->id])
+                    ->cron($scheduledRestore->backupSchedule->expression);
+            }
+        } catch (QueryException) {
+            // Table may not exist yet (pre-migration)
+        }
+
+        // Cleanup expired snapshots (default: every day at 4:00 AM)
+        $schedule->command('snapshots:cleanup')->cron(AppConfig::get('backup.cleanup_cron'));
+
+        // Verify snapshot files exist on volumes (default: every day at 5:00 AM)
+        $schedule->command('snapshots:verify-files')
+            ->cron(AppConfig::get('backup.verify_files_cron'))
+            ->when(fn () => AppConfig::get('backup.verify_files'));
+
+        // Recover stuck jobs (expired agent leases and timed-out backup jobs)
+        $schedule->command('jobs:recover-stuck')->everyFiveMinutes();
+    })
+    ->withMiddleware(function (Middleware $middleware) {
+        $middleware->trustProxies(
+            at: env('TRUSTED_PROXIES', TRUSTED_PROXIES_DEFAULT),
+            headers: Request::HEADER_X_FORWARDED_FOR |
+            Request::HEADER_X_FORWARDED_HOST |
+            Request::HEADER_X_FORWARDED_PORT |
+            Request::HEADER_X_FORWARDED_PROTO |
+            Request::HEADER_X_FORWARDED_AWS_ELB |
+            Request::HEADER_X_FORWARDED_TRAEFIK
+        );
+        $middleware->web(prepend: [
+            \App\Http\Middleware\DemoModeMiddleware::class,
+        ]);
+        $middleware->web(append: [
+            \App\Http\Middleware\EnsureUserIsActive::class,
+            \App\Http\Middleware\SetCurrentOrganization::class,
+            \App\Http\Middleware\ScopeBouncer::class,
+            \App\Http\Middleware\SetLocale::class,
+        ]);
+        $middleware->api(prepend: [
+            \Laravel\Sanctum\Http\Middleware\EnsureFrontendRequestsAreStateful::class,
+        ]);
+        $middleware->api(append: [
+            \App\Http\Middleware\SetCurrentOrganization::class,
+            \App\Http\Middleware\ScopeBouncer::class,
+        ]);
+        // OrganizationScope is a no-op while no organization is resolved, so
+        // SetCurrentOrganization has to run ahead of SubstituteBindings: a route
+        // {model} parameter bound before it resolves across every tenant.
+        $middleware->prependToPriorityList(
+            \Illuminate\Routing\Middleware\SubstituteBindings::class,
+            \App\Http\Middleware\SetCurrentOrganization::class,
+        );
+        $middleware->preventRequestForgery(except: [
+            'adminer',
+        ]);
+        $middleware->alias([
+            'agent' => \App\Http\Middleware\EnsureAgentToken::class,
+            'user' => \App\Http\Middleware\EnsureUserToken::class,
+            'throttle-failed-agent-auth' => \App\Http\Middleware\ThrottleFailedAgentAuth::class,
+        ]);
+    })
+    ->withExceptions(function (Exceptions $exceptions) {
+        // An agent reporting on a job cancelled after its request was let in.
+        $exceptions->dontReport(\App\Exceptions\Backup\JobCancelledException::class);
+        $exceptions->render(fn (\App\Exceptions\Backup\JobCancelledException $e) => response()->json(['message' => $e->getMessage()], 409));
+
+        $exceptions->renderable(function (\Illuminate\Contracts\Encryption\DecryptException $e, $request) {
+            if ($request->is('two-factor-challenge')) {
+                return redirect()->route('login')->withErrors([
+                    'email' => __('Your session or encryption key has changed. Please log in again. If this persists, your APP_KEY may have changed since two-factor authentication was set up.'),
+                ]);
+            }
+        });
+    })->create();

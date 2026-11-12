@@ -1,0 +1,27 @@
+{{- if .Values.app.enabled }}
+{{- if .Values.persistence.enabled }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "databasement.fullname" . }}-storage
+  labels:
+    {{- include "databasement.labels" . | nindent 4 }}
+  {{- with .Values.persistence.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  accessModes:
+    {{- if and .Values.worker.enabled .Values.worker.separateDeployment }}
+    - ReadWriteMany
+    {{- else }}
+    {{- toYaml .Values.persistence.accessModes | nindent 4 }}
+    {{- end }}
+  {{- if .Values.persistence.storageClass }}
+  storageClassName: {{ .Values.persistence.storageClass | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.persistence.size | quote }}
+{{- end }}
+{{- end }}

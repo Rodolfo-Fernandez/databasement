@@ -1,0 +1,10 @@
+suite: service tests
+chart:
+  version: 0.1.0
+  appVersion: 0.1.0
+templates:
+  - templates/service.yaml
+tests:
+  - it: should render service with default values
+    asserts:
+      - matchSnapshot: {}

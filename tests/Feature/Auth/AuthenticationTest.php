@@ -1,0 +1,202 @@
+<?php
+
+use App\Models\OAuthIdentity;
+use App\Models\User;
+use Laravel\Fortify\Features;
+
+test('login screen can be rendered', function () {
+    User::factory()->create();
+
+    $response = $this->get(route('login'));
+
+    $response->assertStatus(200);
+});
+
+test('login redirects to register when no users exist', function () {
+    // Guard against an ambient DEMO_MODE=true, which would make the login page
+    // lazily create the demo user and break the "no users" precondition.
+    config(['app.demo_mode' => false]);
+
+    $response = $this->get(route('login'));
+
+    $response->assertRedirect(route('register'));
+});
+
+test('users can authenticate using the login screen', function () {
+    $user = User::factory()->withoutTwoFactor()->create();
+
+    $response = $this->post(route('login.store'), [
+        'email' => $user->email,
+        'password' => 'password',
+    ]);
+
+    $response
+        ->assertSessionHasNoErrors()
+        ->assertRedirect(route('dashboard', absolute: false));
+
+    $this->assertAuthenticated();
+});
+
+test('users can not authenticate with invalid password', function () {
+    $user = User::factory()->create();
+
+    $response = $this->post(route('login.store'), [
+        'email' => $user->email,
+        'password' => 'wrong-password',
+    ]);
+
+    $response->assertSessionHasErrorsIn('email');
+
+    $this->assertGuest();
+});
+
+test('oauth users see helpful error when trying to login with password', function () {
+    $user = User::factory()->create(['password' => null]);
+    OAuthIdentity::create([
+        'user_id' => $user->id,
+        'provider' => 'github',
+        'provider_user_id' => 'github-123',
+        'email' => $user->email,
+    ]);
+
+    $response = $this->post(route('login.store'), [
+        'email' => $user->email,
+        'password' => 'any-password',
+    ]);
+
+    $response->assertSessionHasErrors([
+        'email' => 'This account uses OAuth login. Please use the OAuth button below to sign in.',
+    ]);
+
+    $this->assertGuest();
+});
+
+test('users with two factor enabled are redirected to two factor challenge', function () {
+    if (! Features::canManageTwoFactorAuthentication()) {
+        $this->markTestSkipped('Two-factor authentication is not enabled.');
+    }
+
+    Features::twoFactorAuthentication([
+        'confirm' => true,
+        'confirmPassword' => true,
+    ]);
+
+    $user = User::factory()->create();
+
+    $response = $this->post(route('login.store'), [
+        'email' => $user->email,
+        'password' => 'password',
+    ]);
+
+    $response->assertRedirect(route('two-factor.login'));
+    $this->assertGuest();
+});
+
+test('two factor challenge with invalid encryption key redirects to login', function () {
+    if (! Features::canManageTwoFactorAuthentication()) {
+        $this->markTestSkipped('Two-factor authentication is not enabled.');
+    }
+
+    Features::twoFactorAuthentication([
+        'confirm' => true,
+        'confirmPassword' => true,
+    ]);
+
+    $user = User::factory()->create();
+
+    // Login to trigger 2FA challenge
+    $this->post(route('login.store'), [
+        'email' => $user->email,
+        'password' => 'password',
+    ]);
+
+    // Corrupt the two_factor_secret to simulate an APP_KEY change
+    $user->update(['two_factor_secret' => 'corrupted-encrypted-value']);
+
+    $response = $this->post(route('two-factor.login.store'), [
+        'code' => '123456',
+    ]);
+
+    $response->assertRedirect(route('login'));
+    $response->assertSessionHasErrors('email');
+});
+
+test('login screen renders oauth provider button when enabled', function (string $provider, string $label) {
+    User::factory()->create();
+
+    config()->set("oauth.providers.{$provider}.enabled", true);
+    config()->set("oauth.providers.{$provider}.client_id", 'test');
+    config()->set("oauth.providers.{$provider}.client_secret", 'test');
+
+    if ($provider === 'oidc') {
+        config()->set('oauth.providers.oidc.base_url', 'https://idp.example.com');
+    }
+
+    $response = $this->get(route('login'));
+
+    $response->assertStatus(200);
+    $response->assertSeeText("Continue with {$label}");
+})->with([
+    'google' => ['google', 'Google'],
+    'github' => ['github', 'GitHub'],
+    'gitlab' => ['gitlab', 'GitLab'],
+    'oidc' => ['oidc', 'SSO'],
+]);
+
+test('user without organization is logged out with error', function () {
+    $user = User::factory()->create();
+    $user->organizations()->detach();
+
+    $response = $this->actingAs($user)->get(route('dashboard'));
+
+    $response->assertRedirect(route('login'));
+    $this->assertGuest();
+});
+
+test('oauth-only mode hides password form on login screen', function () {
+    User::factory()->create();
+    config()->set('oauth.only_mode', true);
+    config()->set('oauth.providers.github.enabled', true);
+    config()->set('oauth.providers.github.client_id', 'test');
+    config()->set('oauth.providers.github.client_secret', 'test');
+
+    $response = $this->get(route('login'));
+
+    $response->assertStatus(200);
+    $response->assertDontSee('name="password"', false);
+    $response->assertDontSee(route('login.store'));
+    $response->assertSeeText('Continue with GitHub');
+});
+
+test('oauth-only mode rejects password authentication even with valid credentials', function () {
+    $user = User::factory()->withoutTwoFactor()->create();
+    config()->set('oauth.only_mode', true);
+
+    $response = $this->post(route('login.store'), [
+        'email' => $user->email,
+        'password' => 'password',
+    ]);
+
+    $response->assertSessionHasErrors([
+        'email' => 'Password login is disabled. Please sign in with an OAuth provider.',
+    ]);
+
+    $this->assertGuest();
+});
+
+test('oauth-only mode disables password reset routes', function () {
+    User::factory()->create();
+    config()->set('oauth.only_mode', true);
+
+    $this->get('/forgot-password')->assertNotFound();
+});
+
+test('users can logout', function () {
+    $user = User::factory()->create();
+
+    $response = $this->actingAs($user)->post(route('logout'));
+
+    $response->assertRedirect(route('home'));
+
+    $this->assertGuest();
+});

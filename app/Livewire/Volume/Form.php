@@ -1,0 +1,244 @@
+<?php
+
+namespace App\Livewire\Volume;
+
+use App\Actions\Volume\CreateVolumeAction;
+use App\Actions\Volume\UpdateVolumeAction;
+use App\Enums\VolumeType;
+use App\Models\Volume;
+use App\Services\CurrentOrganization;
+use App\Services\VolumeConnectionTester;
+use App\Support\Formatters;
+use Illuminate\Validation\Rule;
+use Illuminate\Validation\Rules\Unique;
+use Illuminate\Validation\ValidationException;
+use Livewire\Component;
+
+class Form extends \Livewire\Form
+{
+    public ?Volume $volume = null;
+
+    public string $name = '';
+
+    public string $type = 'local';
+
+    // Optional storage quota for the volume, entered in GB. Empty = no limit.
+    // Stored under the `max_storage_bytes` key of the volume's config JSON.
+    public ?string $maxStorageGb = null;
+
+    // When true, reaching the limit only sends a notification instead of failing
+    // the backup. Stored under the `max_storage_notify_only` config key.
+    public bool $storageLimitNotifyOnly = false;
+
+    // Config arrays for each volume type (initialized from connector defaults in constructor)
+    /** @var array<string, mixed> */
+    public array $localConfig = [];
+
+    /** @var array<string, mixed> */
+    public array $s3Config = [];
+
+    /** @var array<string, mixed> */
+    public array $sftpConfig = [];
+
+    /** @var array<string, mixed> */
+    public array $ftpConfig = [];
+
+    /** @var array<string, mixed> */
+    public array $azureConfig = [];
+
+    /** @var array<string, mixed> */
+    public array $smbConfig = [];
+
+    // Connection test state
+    public ?string $connectionTestMessage = null;
+
+    public bool $connectionTestSuccess = false;
+
+    public function __construct(
+        Component $component,
+        mixed $propertyName,
+    ) {
+        parent::__construct($component, $propertyName);
+
+        // Initialize config arrays with defaults from each connector class
+        foreach (VolumeType::cases() as $volumeType) {
+            $configClass = $volumeType->configClass();
+            $propertyName = $volumeType->configPropertyName();
+            $this->{$propertyName} = $configClass::defaultConfig();
+        }
+    }
+
+    public function setVolume(Volume $volume): void
+    {
+        $this->volume = $volume;
+        $this->name = $volume->name;
+        $this->type = $volume->type;
+
+        // Load decrypted config, masking sensitive fields to prevent browser serialization
+        $volumeType = VolumeType::from($volume->type);
+        $decryptedConfig = $volumeType->maskSensitiveFields($volume->getDecryptedConfig());
+        $propertyName = $volumeType->configPropertyName();
+        $this->{$propertyName} = array_merge($this->{$propertyName}, $decryptedConfig);
+
+        $this->maxStorageGb = Formatters::bytesToGb($volume->maxStorageBytes());
+        $this->storageLimitNotifyOnly = $volume->storageLimitIsNotifyOnly();
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    private function rules(): array
+    {
+        $rules = [
+            'name' => ['required', 'string', 'max:255'],
+            'type' => ['required', 'string', 'in:'.implode(',', array_column(VolumeType::cases(), 'value'))],
+            'maxStorageGb' => ['nullable', 'numeric', 'min:0.001'],
+            'storageLimitNotifyOnly' => ['boolean'],
+        ];
+
+        // Merge rules from all connector classes
+        foreach (VolumeType::cases() as $volumeType) {
+            $configClass = $volumeType->configClass();
+            $rules = [...$rules, ...$configClass::rules($volumeType->configPropertyName())];
+        }
+
+        // When editing, make sensitive fields optional (blank to keep existing)
+        if ($this->volume !== null) {
+            $rules = VolumeType::from($this->type)->makeRulesOptionalForSensitiveFields($rules);
+        }
+
+        return $rules;
+    }
+
+    public function store(): void
+    {
+        $rules = $this->rules();
+        $rules['name'][] = $this->uniqueNameRule(app(CurrentOrganization::class)->id());
+
+        $this->validate($rules);
+
+        CreateVolumeAction::run(
+            app(CurrentOrganization::class)->model(),
+            VolumeType::from($this->type),
+            $this->name,
+            $this->applyMaxStorageToConfig($this->getActiveConfig()),
+        );
+    }
+
+    public function update(): void
+    {
+        $rules = $this->rules();
+        $rules['name'][] = $this->uniqueNameRule($this->volume->organization_id, ignoreId: $this->volume->id);
+
+        $this->validate($rules);
+
+        UpdateVolumeAction::run($this->volume, $this->name, $this->applyMaxStorageToConfig($this->getActiveConfig()));
+    }
+
+    /**
+     * Volume names are unique within an organization only.
+     */
+    private function uniqueNameRule(string $organizationId, ?string $ignoreId = null): Unique
+    {
+        return Rule::unique('volumes', 'name')->where('organization_id', $organizationId)->ignore($ignoreId);
+    }
+
+    /**
+     * Update a volume that is locked by existing snapshots: only the name and
+     * storage limit stay editable — the connector config is frozen because
+     * stored snapshots already depend on it.
+     */
+    public function updateLockedVolume(): void
+    {
+        $this->validate([
+            'name' => ['required', 'string', 'max:255', $this->uniqueNameRule($this->volume->organization_id, ignoreId: $this->volume->id)],
+            'maxStorageGb' => ['nullable', 'numeric', 'min:0.001'],
+            'storageLimitNotifyOnly' => ['boolean'],
+        ]);
+
+        UpdateVolumeAction::run($this->volume, $this->name, $this->applyMaxStorageToConfig($this->volume->getDecryptedConfig()));
+    }
+
+    /**
+     * Get the active config array based on current type.
+     *
+     * @return array<string, mixed>
+     */
+    public function getActiveConfig(): array
+    {
+        return $this->{VolumeType::from($this->type)->configPropertyName()};
+    }
+
+    /**
+     * Store the storage quota (GB from the form, in bytes) under the config's
+     * `max_storage_bytes` key, along with the notify-only flag. Both keys are
+     * removed when the limit field is left empty (the flag is meaningless
+     * without a limit).
+     *
+     * @param  array<string, mixed>  $config
+     * @return array<string, mixed>
+     */
+    protected function applyMaxStorageToConfig(array $config): array
+    {
+        $bytes = Formatters::gbToBytes($this->maxStorageGb);
+
+        if ($bytes === null) {
+            unset($config['max_storage_bytes'], $config['max_storage_notify_only']);
+
+            return $config;
+        }
+
+        $config['max_storage_bytes'] = $bytes;
+
+        if ($this->storageLimitNotifyOnly) {
+            $config['max_storage_notify_only'] = true;
+        } else {
+            unset($config['max_storage_notify_only']);
+        }
+
+        return $config;
+    }
+
+    public function testConnection(): void
+    {
+        $this->connectionTestMessage = null;
+
+        $volumeType = VolumeType::from($this->type);
+
+        // Get validation rules for current type only
+        $filteredRules = $volumeType->configRules();
+
+        // When editing, make sensitive fields optional (blank to keep existing)
+        if ($this->volume !== null) {
+            $filteredRules = $volumeType->makeRulesOptionalForSensitiveFields($filteredRules);
+        }
+
+        try {
+            $this->validate($filteredRules);
+        } catch (ValidationException) {
+            $this->connectionTestSuccess = false;
+            $this->connectionTestMessage = __('Please fill in all required configuration fields.');
+
+            return;
+        }
+
+        // Build config for testing, merging persisted sensitive values when form is empty
+        $testConfig = $this->volume !== null
+            ? $volumeType->mergeSensitiveFromPersisted($this->getActiveConfig(), $this->volume->getDecryptedConfig())
+            : $this->getActiveConfig();
+
+        /** @var VolumeConnectionTester $tester */
+        $tester = app(VolumeConnectionTester::class);
+
+        $testVolume = new Volume([
+            'name' => $this->name ?: 'test-volume',
+            'type' => $this->type,
+            'config' => $testConfig,
+        ]);
+
+        $result = $tester->test($testVolume);
+
+        $this->connectionTestSuccess = $result['success'];
+        $this->connectionTestMessage = $result['message'];
+    }
+}

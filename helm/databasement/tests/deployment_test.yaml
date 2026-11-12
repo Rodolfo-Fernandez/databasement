@@ -1,0 +1,395 @@
+suite: deployment tests
+chart:
+  version: 0.1.0
+  appVersion: 0.1.0
+templates:
+  - templates/deployment.yaml
+set:
+  app.appKey.value: "base64:test-key-for-unit-tests"
+tests:
+  - it: should fail when app.appKey.value is not set
+    set:
+      app.appKey.value: ""
+    asserts:
+      - failedTemplate:
+          errorMessage: "app.appKey.value is required. Generate one with: docker run --rm davidcrty/databasement:latest php artisan key:generate --show"
+
+  - it: should render when app.appKey.fromSecret is used instead of value
+    set:
+      app.appKey.value: ""
+      app.appKey.fromSecret.secretName: "my-existing-secret"
+      app.appKey.fromSecret.secretKey: "APP_KEY"
+    asserts:
+      - isKind:
+          of: Deployment
+
+  - it: should render deployment with default values
+    asserts:
+      - matchSnapshot: {}
+
+  - it: should log plain text when logging.formatter is empty
+    set:
+      logging.formatter: ""
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: LOG_STDERR_FORMATTER
+            value: Monolog\Formatter\JsonFormatter
+
+  - it: should render deployment with mysql database
+    set:
+      database:
+        connection: mysql
+        host: mysql.example.com
+        port: 3306
+        name: mydb
+        username: myuser
+        password:
+          value: mypassword
+    asserts:
+      - matchSnapshot: {}
+
+  - it: should include worker sidecar container when enabled (default sidecar mode)
+    set:
+      worker:
+        enabled: true
+        separateDeployment: false
+    asserts:
+      - lengthEqual:
+          path: spec.template.spec.containers
+          count: 2
+      - equal:
+          path: spec.template.spec.containers[1].name
+          value: databasement-worker
+
+  - it: should not include worker sidecar container when disabled
+    set:
+      worker:
+        enabled: false
+    asserts:
+      - lengthEqual:
+          path: spec.template.spec.containers
+          count: 1
+
+  - it: should not include worker sidecar when separateDeployment is true
+    set:
+      worker:
+        enabled: true
+        separateDeployment: true
+    asserts:
+      - lengthEqual:
+          path: spec.template.spec.containers
+          count: 1
+
+  - it: should run the sidecar worker as a queue-only image
+    set:
+      worker:
+        enabled: true
+        separateDeployment: false
+    asserts:
+      - notExists:
+          path: spec.template.spec.containers[1].args
+      - contains:
+          path: spec.template.spec.containers[1].env
+          content:
+            name: ENABLE_QUEUE_WORKER
+            value: "true"
+      - contains:
+          path: spec.template.spec.containers[1].env
+          content:
+            name: ENABLE_WEB_SERVER
+            value: "false"
+      - contains:
+          path: spec.template.spec.containers[1].env
+          content:
+            name: ENABLE_SCHEDULER
+            value: "false"
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: ENABLE_WEB_SERVER
+            value: "false"
+
+  - it: should apply worker resources in sidecar mode
+    set:
+      worker:
+        enabled: true
+        separateDeployment: false
+        resources:
+          limits:
+            cpu: 500m
+            memory: 512Mi
+          requests:
+            cpu: 100m
+            memory: 128Mi
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[1].name
+          value: databasement-worker
+      - equal:
+          path: spec.template.spec.containers[1].resources.limits.cpu
+          value: 500m
+      - equal:
+          path: spec.template.spec.containers[1].resources.limits.memory
+          value: 512Mi
+
+  # Separate worker deployment tests
+  - it: should render separate worker deployment when separateDeployment is true
+    set:
+      worker:
+        enabled: true
+        separateDeployment: true
+        replicaCount: 2
+    asserts:
+      - hasDocuments:
+          count: 2
+      - documentIndex: 1
+        equal:
+          path: metadata.name
+          value: RELEASE-NAME-databasement-worker
+      - documentIndex: 1
+        equal:
+          path: spec.replicas
+          value: 2
+
+  - it: should not render separate worker deployment when separateDeployment is false
+    set:
+      worker:
+        enabled: true
+        separateDeployment: false
+    asserts:
+      - hasDocuments:
+          count: 1
+
+  - it: should label app pods with the component the service selects
+    set:
+      podLabels:
+        app.kubernetes.io/component: custom
+    asserts:
+      - documentIndex: 0
+        equal:
+          path: spec.template.metadata.labels["app.kubernetes.io/component"]
+          value: app
+
+  - it: should have worker component label in separate deployment
+    set:
+      worker:
+        enabled: true
+        separateDeployment: true
+    asserts:
+      - documentIndex: 1
+        equal:
+          path: metadata.labels["app.kubernetes.io/component"]
+          value: worker
+      - documentIndex: 1
+        equal:
+          path: spec.selector.matchLabels["app.kubernetes.io/component"]
+          value: worker
+
+  - it: should run the separate worker deployment as a queue-only image
+    set:
+      worker:
+        enabled: true
+        separateDeployment: true
+    asserts:
+      - documentIndex: 1
+        notExists:
+          path: spec.template.spec.containers[0].args
+      - documentIndex: 1
+        contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: ENABLE_QUEUE_WORKER
+            value: "true"
+      - documentIndex: 1
+        contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: ENABLE_WEB_SERVER
+            value: "false"
+
+  - it: should apply worker resources in separate deployment
+    set:
+      worker:
+        enabled: true
+        separateDeployment: true
+        resources:
+          limits:
+            cpu: 500m
+            memory: 512Mi
+    asserts:
+      - documentIndex: 1
+        equal:
+          path: spec.template.spec.containers[0].resources.limits.cpu
+          value: 500m
+      - documentIndex: 1
+        equal:
+          path: spec.template.spec.containers[0].resources.limits.memory
+          value: 512Mi
+
+  # Extra volumes tests
+  - it: should add extra volumes and mounts to app container
+    set:
+      extraVolumes:
+        - name: config
+          configMap:
+            name: my-config
+      extraVolumeMounts:
+        - name: config
+          mountPath: /etc/config
+    asserts:
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: config
+            configMap:
+              name: my-config
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: config
+            mountPath: /etc/config
+
+  - it: should mount extra volumes in worker sidecar
+    set:
+      worker:
+        enabled: true
+        separateDeployment: false
+      extraVolumeMounts:
+        - name: secrets
+          mountPath: /etc/secrets
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[1].volumeMounts
+          content:
+            name: secrets
+            mountPath: /etc/secrets
+
+  - it: should mount extra volumes in separate worker deployment
+    set:
+      worker:
+        enabled: true
+        separateDeployment: true
+      extraVolumes:
+        - name: cache
+          emptyDir: {}
+      extraVolumeMounts:
+        - name: cache
+          mountPath: /tmp/cache
+    asserts:
+      - documentIndex: 1
+        contains:
+          path: spec.template.spec.volumes
+          content:
+            name: cache
+            emptyDir: {}
+      - documentIndex: 1
+        contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: cache
+            mountPath: /tmp/cache
+
+  # Custom environment variables tests
+  - it: should add custom env vars to app container
+    set:
+      extraEnv:
+        AWS_REGION: us-east-1
+        CUSTOM_VAR: my-value
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: AWS_REGION
+            value: "us-east-1"
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: CUSTOM_VAR
+            value: "my-value"
+
+  - it: should add custom env vars to worker sidecar container
+    set:
+      worker:
+        enabled: true
+        separateDeployment: false
+      extraEnv:
+        AWS_REGION: eu-west-1
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[1].env
+          content:
+            name: AWS_REGION
+            value: "eu-west-1"
+
+  - it: should add custom env vars to separate worker deployment
+    set:
+      worker:
+        enabled: true
+        separateDeployment: true
+      extraEnv:
+        QUEUE_CONNECTION: redis
+    asserts:
+      - documentIndex: 1
+        contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: QUEUE_CONNECTION
+            value: "redis"
+
+  # extraEnvFrom tests
+  - it: should add envFrom with secretRef to app container
+    set:
+      extraEnvFrom:
+        - secretRef:
+            name: my-secret
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].envFrom
+          content:
+            secretRef:
+              name: my-secret
+
+  - it: should add envFrom with configMapRef to app container
+    set:
+      extraEnvFrom:
+        - configMapRef:
+            name: my-config
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].envFrom
+          content:
+            configMapRef:
+              name: my-config
+
+  - it: should add envFrom to worker sidecar container
+    set:
+      worker:
+        enabled: true
+        separateDeployment: false
+      extraEnvFrom:
+        - secretRef:
+            name: aws-credentials
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[1].envFrom
+          content:
+            secretRef:
+              name: aws-credentials
+
+  - it: should add envFrom to separate worker deployment
+    set:
+      worker:
+        enabled: true
+        separateDeployment: true
+      extraEnvFrom:
+        - secretRef:
+            name: worker-secrets
+    asserts:
+      - documentIndex: 1
+        contains:
+          path: spec.template.spec.containers[0].envFrom
+          content:
+            secretRef:
+              name: worker-secrets

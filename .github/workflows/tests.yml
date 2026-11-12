@@ -1,0 +1,160 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    container:
+      image: davidcrty/databasement-php:latest
+
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: root
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h localhost"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+
+      # Its own service: MySQL is dumped by Oracle's client, MariaDB by mariadb-dump.
+      mariadb:
+        image: mariadb:11.8
+        env:
+          MARIADB_ROOT_PASSWORD: root
+        ports:
+          - 3307:3306
+        options: >-
+          --health-cmd="healthcheck.sh --connect --innodb_initialized"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: root
+          POSTGRES_PASSWORD: root
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+
+      mongodb:
+        image: mongo:7
+        env:
+          MONGO_INITDB_ROOT_USERNAME: root
+          MONGO_INITDB_ROOT_PASSWORD: root
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd="mongosh --eval 'db.adminCommand({ping:1})' --quiet"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+
+      mssql:
+        image: mcr.microsoft.com/azure-sql-edge:latest
+        env:
+          ACCEPT_EULA: "Y"
+          MSSQL_SA_PASSWORD: "Databasement!Strong1"
+        ports:
+          - 1433:1433
+        options: >-
+          --health-cmd="/opt/mssql-tools/bin/sqlcmd -S localhost -U sa -P Databasement!Strong1 -Q 'SELECT 1'"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=20
+
+      firebird:
+        image: firebirdsql/firebird:5
+        env:
+          FIREBIRD_ROOT_PASSWORD: masterkey
+          FIREBIRD_DATABASE: sample.fdb
+        ports:
+          - 3050:3050
+        options: >-
+          --health-cmd="echo 'QUIT;' | isql -user SYSDBA -password masterkey /var/lib/firebird/data/sample.fdb"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=20
+
+      ssh:
+        image: linuxserver/openssh-server:latest
+        env:
+          PUID: 1000
+          PGID: 1000
+          TZ: UTC
+          USER_NAME: testuser
+          USER_PASSWORD: testpass
+          PASSWORD_ACCESS: "true"
+          DOCKER_MODS: linuxserver/mods:openssh-server-ssh-tunnel
+        ports:
+          - 2222:2222
+        options: >-
+          --health-cmd="netstat -tlnp | grep ':2222' || exit 1"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Dependencies
+        run: composer install --no-interaction --prefer-dist --optimize-autoloader
+
+      - name: Generate Application Key
+        run: php artisan key:generate
+
+      - name: Run Pint
+        run: vendor/bin/pint
+
+      - name: Migrate database
+        run: php artisan migrate --force
+
+      - name: Generate IDE helper models
+        run: php artisan ide-helper:models --write-mixin --no-interaction
+
+      - name: Run phpstan
+        run: vendor/bin/phpstan analyse
+
+      # Always the full suite. Pest's Test Impact Analysis (`make test-tia`) is a
+      # local-only convenience and is never enabled here — CI must verify every
+      # test against a clean checkout.
+      - name: Run Tests
+        run: php artisan test --parallel --coverage-clover=coverage.xml --log-junit junit.xml
+
+      - name: Upload coverage artifact
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-reports
+          path: |
+            coverage.xml
+            junit.xml
+          retention-days: 1
+          if-no-files-found: ignore

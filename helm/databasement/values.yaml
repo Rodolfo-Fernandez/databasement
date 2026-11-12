@@ -1,0 +1,202 @@
+# Default values for databasement
+# This is a YAML-formatted file.
+
+replicaCount: 1
+
+image:
+  repository: davidcrty/databasement
+  pullPolicy: Always
+  tag: "0.0.0-dev"
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+deploymentStrategy: ""
+
+port: 2226
+
+# Application configuration
+app:
+  # Set to false to deploy only the agents defined under `agents`
+  enabled: true
+  name: Databasement
+  env: production
+  debug: false
+  url: http://localhost:2226
+  # Application encryption key (required)
+  # Generate with: docker run --rm davidcrty/databasement:latest php artisan key:generate --show
+  appKey:
+    value: ""
+    # Generate key from secret
+#    fromSecret:
+#      secretName: ""
+#      secretKey: ""
+
+# Database configuration
+database:
+  # Database driver: sqlite, mysql, pgsql
+  connection: sqlite
+  # For SQLite
+  sqlitePath: /data/database.sqlite
+  # For MySQL/PostgreSQL
+  host: ""
+  port: 3306
+  name: databasement
+  username: databasement
+  password:
+    value: ""
+    # Use existing secret for database password
+#    fromSecret:
+#      secretName: ""
+#      secretKey: ""
+resources:
+  limits:
+    cpu: 500m
+    memory: 1024Mi
+  requests:
+    cpu: 100m
+    memory: 512Mi
+# Extra environment variables to add to app and worker containers
+# See available variables on https://david-crty.github.io/databasement/self-hosting/configuration
+extraEnv: {}
+#  AWS_REGION: us-east-1
+extraEnvFrom: []
+#  - secretRef:
+#      name: my-secret
+#  - configMapRef:
+#      name: my-config
+
+# Extra volumes and mounts to add to app and worker containers
+# See https://kubernetes.io/docs/concepts/storage/volumes/ for more info
+extraVolumeMounts: {}
+extraVolumes: {}
+
+# Worker configuration
+# Only deployed when app.enabled is true
+worker:
+  enabled: true
+  resources:
+    limits:
+      cpu: 500m
+      memory: 512Mi
+    requests:
+      cpu: 100m
+      memory: 256Mi
+  # Deploy worker as separate deployment (requires ReadWriteMany storage or external database)
+  # When false (default), worker runs as sidecar container in the same pod as the app
+  separateDeployment: false
+  replicaCount: 1
+
+# Remote agents
+# Each enabled entry runs one Databasement agent (its own Deployment, and a Secret when
+# the token is given inline). Set app.enabled=false to deploy agents only, e.g. next to
+# databases in another cluster or namespace.
+# See https://david-crty.github.io/databasement/user-guide/agents
+agents: {}
+#  main:
+#    enabled: true
+#    # URL of the Databasement server the agent connects to
+#    url: https://databasement.example.com
+#    # Token shown once when the agent is created in Databasement
+#    token:
+#      value: ""
+#      # Use existing secret for the agent token
+#      fromSecret:
+#        secretName: ""
+#        secretKey: ""
+#    # Optional, defaults shown
+#    pollInterval: 5
+#    # Agents do not inherit the app's extraEnv, extraEnvFrom or extra volumes
+#    extraEnv: {}
+#    extraEnvFrom: []
+#    extraVolumeMounts: []
+#    extraVolumes: []
+#    resources:
+#      limits:
+#        cpu: 500m
+#        memory: 512Mi
+#      requests:
+#        cpu: 50m
+#        memory: 128Mi
+
+# Logging
+logging:
+  channel: stdio
+  level: warning
+  # One JSON object per entry, for log collectors. Leave empty for plain text.
+  formatter: Monolog\Formatter\JsonFormatter
+
+# Ingress
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+    # kubernetes.io/ingress.class: nginx
+    # cert-manager.io/cluster-issuer: letsencrypt-prod
+  host: databasement.local
+  tlsSecretName: ""
+
+# Persistence for storage volume
+persistence:
+  enabled: true
+  storageClass: ""
+  accessModes:
+    - ReadWriteOnce
+  size: 10Gi
+  annotations: {}
+  path: /data
+
+# Liveness and readiness probes
+livenessProbe:
+  httpGet:
+    path: /health
+    port: http
+  periodSeconds: 10
+  timeoutSeconds: 5
+  failureThreshold: 3
+
+readinessProbe:
+  httpGet:
+    path: /health
+    port: http
+  periodSeconds: 5
+  timeoutSeconds: 3
+  failureThreshold: 3
+
+startupProbe:
+  httpGet:
+    path: /health
+    port: http
+  initialDelaySeconds: 5
+  periodSeconds: 3
+  timeoutSeconds: 3
+  failureThreshold: 30
+
+serviceAccount:
+  create: false
+  automount: true
+  annotations: {}
+  name: ""
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+  fsGroupChangePolicy: OnRootMismatch
+
+securityContext: {}
+
+service:
+  type: ClusterIP
+  port: 80
+
+nodeSelector: {}
+
+tolerations: []
+
+affinity: {}
+

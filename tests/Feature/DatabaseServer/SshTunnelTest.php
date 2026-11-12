@@ -1,0 +1,498 @@
+<?php
+
+use App\Enums\Ability;
+use App\Livewire\DatabaseServer\Create;
+use App\Livewire\DatabaseServer\Edit;
+use App\Models\DatabaseServer;
+use App\Models\DatabaseServerSshConfig;
+use App\Models\User;
+use App\Models\Volume;
+use App\Services\SshTunnelService;
+use Illuminate\Foundation\Testing\RefreshDatabase;
+use Livewire\Livewire;
+
+uses(RefreshDatabase::class);
+
+test('can create database server with SSH tunnel (password auth)', function () {
+    $user = User::factory()->withAbilities([Ability::ManageDatabaseServers->value])->create();
+    $volume = Volume::factory()->local()->create(['name' => 'Test Volume']);
+
+    Livewire::actingAs($user)
+        ->test(Create::class)
+        ->set('form.name', 'SSH Tunnel Server')
+        ->set('form.database_type', 'mysql')
+        ->set('form.host', 'private-db.internal')
+        ->set('form.port', 3306)
+        ->set('form.username', 'dbuser')
+        ->set('form.password', 'secret123')
+        ->set('form.backups.0.database_names.0', 'myapp_production')
+        ->set('form.backups.0.volume_ids', [$volume->id])
+        ->set('form.backups.0.backup_schedule_id', dailySchedule()->id)
+        ->set('form.backups.0.retention_days', 14)
+        // SSH tunnel config
+        ->set('form.ssh_enabled', true)
+        ->set('form.ssh_config_mode', 'create')
+        ->set('form.ssh_host', 'bastion.example.com')
+        ->set('form.ssh_port', 22)
+        ->set('form.ssh_username', 'tunnel_user')
+        ->set('form.ssh_auth_type', 'password')
+        ->set('form.ssh_password', 'ssh_secret')
+        ->call('save')
+        ->assertHasNoErrors()
+        ->assertRedirect(route('database-servers.index'));
+
+    $this->assertDatabaseHas('database_servers', [
+        'name' => 'SSH Tunnel Server',
+        'database_type' => 'mysql',
+    ]);
+
+    $server = DatabaseServer::where('name', 'SSH Tunnel Server')->first();
+    expect($server->ssh_config_id)->not->toBeNull();
+    expect($server->sshConfig)->not->toBeNull();
+    expect($server->sshConfig->host)->toBe('bastion.example.com');
+    expect($server->sshConfig->port)->toBe(22);
+    expect($server->sshConfig->username)->toBe('tunnel_user');
+    expect($server->sshConfig->auth_type)->toBe('password');
+    // Password should be stored (encrypted by model cast)
+    expect($server->sshConfig->password)->toBe('ssh_secret');
+    // Compression defaults to off when not explicitly enabled
+    expect($server->sshConfig->compression)->toBeFalse();
+});
+
+test('can enable ssh compression when creating a database server', function () {
+    $user = User::factory()->withAbilities([Ability::ManageDatabaseServers->value])->create();
+    $volume = Volume::factory()->local()->create(['name' => 'Test Volume']);
+
+    Livewire::actingAs($user)
+        ->test(Create::class)
+        ->set('form.name', 'SSH Compression Server')
+        ->set('form.database_type', 'mysql')
+        ->set('form.host', 'private-db.internal')
+        ->set('form.port', 3306)
+        ->set('form.username', 'dbuser')
+        ->set('form.password', 'secret123')
+        ->set('form.backups.0.database_names.0', 'myapp_production')
+        ->set('form.backups.0.volume_ids', [$volume->id])
+        ->set('form.backups.0.backup_schedule_id', dailySchedule()->id)
+        ->set('form.backups.0.retention_days', 14)
+        ->set('form.ssh_enabled', true)
+        ->set('form.ssh_config_mode', 'create')
+        ->set('form.ssh_host', 'bastion.example.com')
+        ->set('form.ssh_port', 22)
+        ->set('form.ssh_username', 'tunnel_user')
+        ->set('form.ssh_auth_type', 'password')
+        ->set('form.ssh_password', 'ssh_secret')
+        ->set('form.ssh_compression', true)
+        ->call('save')
+        ->assertHasNoErrors()
+        ->assertRedirect(route('database-servers.index'));
+
+    $server = DatabaseServer::where('name', 'SSH Compression Server')->first();
+    expect($server->sshConfig->compression)->toBeTrue();
+});
+
+test('can create database server with SSH tunnel (key auth)', function () {
+    $user = User::factory()->withAbilities([Ability::ManageDatabaseServers->value])->create();
+    $volume = Volume::factory()->local()->create(['name' => 'Test Volume']);
+
+    $privateKey = "-----BEGIN OPENSSH PRIVATE KEY-----\ntest_key_content\n-----END OPENSSH PRIVATE KEY-----";
+
+    Livewire::actingAs($user)
+        ->test(Create::class)
+        ->set('form.name', 'SSH Key Auth Server')
+        ->set('form.database_type', 'postgres')
+        ->set('form.host', 'private-postgres.internal')
+        ->set('form.port', 5432)
+        ->set('form.username', 'dbuser')
+        ->set('form.password', 'secret123')
+        ->set('form.backups.0.database_names.0', 'myapp_production')
+        ->set('form.backups.0.volume_ids', [$volume->id])
+        ->set('form.backups.0.backup_schedule_id', dailySchedule()->id)
+        ->set('form.backups.0.retention_days', 14)
+        // SSH tunnel config
+        ->set('form.ssh_enabled', true)
+        ->set('form.ssh_config_mode', 'create')
+        ->set('form.ssh_host', 'bastion.example.com')
+        ->set('form.ssh_port', 2222)
+        ->set('form.ssh_username', 'tunnel_user')
+        ->set('form.ssh_auth_type', 'key')
+        ->set('form.ssh_private_key', $privateKey)
+        ->set('form.ssh_key_passphrase', 'keypass123')
+        ->call('save')
+        ->assertHasNoErrors()
+        ->assertRedirect(route('database-servers.index'));
+
+    $server = DatabaseServer::where('name', 'SSH Key Auth Server')->first();
+    expect($server->sshConfig->auth_type)->toBe('key');
+    expect($server->sshConfig->port)->toBe(2222);
+    // Private key and passphrase should be stored (encrypted by model cast)
+    expect($server->sshConfig->private_key)->toBe($privateKey);
+    expect($server->sshConfig->key_passphrase)->toBe('keypass123');
+});
+
+test('can create database server using existing SSH config', function () {
+    $user = User::factory()->withAbilities([Ability::ManageDatabaseServers->value])->create();
+    $volume = Volume::factory()->local()->create(['name' => 'Test Volume']);
+
+    // Create existing SSH config
+    $existingSshConfig = DatabaseServerSshConfig::factory()->create([
+        'host' => 'shared-bastion.example.com',
+        'username' => 'shared_user',
+    ]);
+
+    Livewire::actingAs($user)
+        ->test(Create::class)
+        ->set('form.name', 'Server Using Existing SSH')
+        ->set('form.database_type', 'mysql')
+        ->set('form.host', 'private-db.internal')
+        ->set('form.port', 3306)
+        ->set('form.username', 'dbuser')
+        ->set('form.password', 'secret123')
+        ->set('form.backups.0.database_names.0', 'myapp_production')
+        ->set('form.backups.0.volume_ids', [$volume->id])
+        ->set('form.backups.0.backup_schedule_id', dailySchedule()->id)
+        ->set('form.backups.0.retention_days', 14)
+        // Use existing SSH config
+        ->set('form.ssh_enabled', true)
+        ->set('form.ssh_config_mode', 'existing')
+        ->set('form.ssh_config_id', $existingSshConfig->id)
+        ->call('save')
+        ->assertHasNoErrors()
+        ->assertRedirect(route('database-servers.index'));
+
+    $server = DatabaseServer::where('name', 'Server Using Existing SSH')->first();
+    expect($server->ssh_config_id)->toBe($existingSshConfig->id);
+    expect($server->sshConfig->host)->toBe('shared-bastion.example.com');
+});
+
+test('requiresSshTunnel returns correct value', function () {
+    $serverWithTunnel = DatabaseServer::factory()->withSshTunnel()->create();
+    $serverWithoutTunnel = DatabaseServer::factory()->create();
+
+    expect($serverWithTunnel->requiresSshTunnel())->toBeTrue();
+    expect($serverWithoutTunnel->requiresSshTunnel())->toBeFalse();
+});
+
+test('SSH config model provides accessor methods', function () {
+    $sshConfig = DatabaseServerSshConfig::factory()->create([
+        'host' => 'bastion.example.com',
+        'port' => 2222,
+        'username' => 'myuser',
+        'password' => 'test_password',
+    ]);
+
+    // getDecrypted returns decrypted values
+    $decrypted = $sshConfig->getDecrypted();
+    expect($decrypted['host'])->toBe('bastion.example.com')
+        ->and($decrypted['password'])->toBe('test_password');
+
+    // getSafe removes sensitive fields
+    $safe = $sshConfig->getSafe();
+    expect($safe)->toHaveKey('host')
+        ->and($safe)->toHaveKey('username')
+        ->and($safe)->not->toHaveKey('password')
+        ->and($safe)->not->toHaveKey('private_key')
+        ->and($safe)->not->toHaveKey('key_passphrase');
+
+    // getDisplayName returns correct format
+    expect($sshConfig->getDisplayName())->toBe('myuser@bastion.example.com:2222');
+});
+
+test('SSH section is shown for SQLite with SFTP label', function () {
+    $user = User::factory()->withAbilities([Ability::ManageDatabaseServers->value])->create();
+
+    Livewire::actingAs($user)
+        ->test(Create::class)
+        ->set('form.database_type', 'sqlite')
+        ->assertSee('Access via SSH (SFTP)');
+});
+
+test('can create SQLite server with SSH config for remote access', function () {
+    $user = User::factory()->withAbilities([Ability::ManageDatabaseServers->value])->create();
+    $volume = Volume::factory()->local()->create(['name' => 'Test Volume']);
+
+    Livewire::actingAs($user)
+        ->test(Create::class)
+        ->set('form.name', 'Remote SQLite via SFTP')
+        ->set('form.database_type', 'sqlite')
+        ->set('form.backups.0.database_names.0', '/data/remote.sqlite')
+        ->set('form.backups.0.volume_ids', [$volume->id])
+        ->set('form.backups.0.backup_schedule_id', dailySchedule()->id)
+        ->set('form.backups.0.retention_days', 14)
+        // SSH config for SFTP
+        ->set('form.ssh_enabled', true)
+        ->set('form.ssh_config_mode', 'create')
+        ->set('form.ssh_host', 'remote.example.com')
+        ->set('form.ssh_port', 22)
+        ->set('form.ssh_username', 'deploy')
+        ->set('form.ssh_auth_type', 'password')
+        ->set('form.ssh_password', 'sftp_secret')
+        ->call('save')
+        ->assertHasNoErrors()
+        ->assertRedirect(route('database-servers.index'));
+
+    $server = DatabaseServer::where('name', 'Remote SQLite via SFTP')->first();
+    expect($server->database_type->value)->toBe('sqlite')
+        ->and($server->backups->first()->database_names)->toBe(['/data/remote.sqlite'])
+        ->and($server->ssh_config_id)->not->toBeNull()
+        ->and($server->sshConfig->host)->toBe('remote.example.com')
+        ->and($server->requiresSftpTransfer())->toBeTrue()
+        ->and($server->requiresSshTunnel())->toBeFalse();
+});
+
+test('updating database server preserves SSH config when not changed', function () {
+    $user = User::factory()->withAbilities([Ability::ManageDatabaseServers->value])->create();
+    $server = DatabaseServer::factory()->withSshTunnel()->create([
+        'database_names' => ['mydb'],
+    ]);
+    $originalSshConfigId = $server->ssh_config_id;
+    $originalHost = $server->sshConfig->host;
+
+    Livewire::actingAs($user)
+        ->test(Edit::class, ['server' => $server])
+        ->set('form.name', 'Updated Name')
+        // SSH fields left empty (should preserve existing)
+        ->call('save')
+        ->assertHasNoErrors();
+
+    $server->refresh();
+    expect($server->name)->toBe('Updated Name');
+    // SSH config should be preserved
+    expect($server->ssh_config_id)->toBe($originalSshConfigId);
+    expect($server->sshConfig->host)->toBe($originalHost);
+});
+
+test('switching a server\'s SSH authentication to a key drops the stored password', function () {
+    $user = User::factory()->withAbilities([Ability::ManageDatabaseServers->value])->create();
+    $server = DatabaseServer::factory()->withSshTunnel()->create(['database_names' => ['mydb']]);
+
+    Livewire::actingAs($user)
+        ->test(Edit::class, ['server' => $server])
+        ->set('form.ssh_auth_type', 'key')
+        ->set('form.ssh_private_key', '-----BEGIN OPENSSH PRIVATE KEY-----')
+        ->call('save')
+        ->assertHasNoErrors();
+
+    expect($server->fresh()->sshConfig)
+        ->auth_type->toBe('key')
+        ->password->toBeNull()
+        ->private_key->toBe('-----BEGIN OPENSSH PRIVATE KEY-----');
+});
+
+test('switching a server\'s SSH authentication requires the new credential', function () {
+    $user = User::factory()->withAbilities([Ability::ManageDatabaseServers->value])->create();
+    $server = DatabaseServer::factory()->withSshTunnel()->create(['database_names' => ['mydb']]);
+
+    Livewire::actingAs($user)
+        ->test(Edit::class, ['server' => $server])
+        ->set('form.ssh_auth_type', 'key')
+        ->call('save')
+        ->assertHasErrors(['form.ssh_private_key' => 'required']);
+
+    expect($server->fresh()->sshConfig)
+        ->auth_type->toBe('password')
+        ->password->not->toBeNull();
+});
+
+test('disabling SSH tunnel clears SSH config link', function () {
+    $user = User::factory()->withAbilities([Ability::ManageDatabaseServers->value])->create();
+    $server = DatabaseServer::factory()->withSshTunnel()->create([
+        'database_names' => ['mydb'],
+    ]);
+
+    expect($server->requiresSshTunnel())->toBeTrue();
+
+    Livewire::actingAs($user)
+        ->test(Edit::class, ['server' => $server])
+        ->set('form.ssh_enabled', false)
+        ->call('save')
+        ->assertHasNoErrors();
+
+    $server->refresh();
+    expect($server->ssh_config_id)->toBeNull();
+    expect($server->requiresSshTunnel())->toBeFalse();
+});
+
+test('choosing "Create new" when editing a server creates a new SSH config and leaves the shared one untouched', function () {
+    $user = User::factory()->withAbilities([Ability::ManageDatabaseServers->value])->create();
+    $server = DatabaseServer::factory()->withSshTunnel()->create(['database_names' => ['mydb']]);
+    $sharedConfig = $server->sshConfig;
+    $otherServer = DatabaseServer::factory()->create(['ssh_config_id' => $sharedConfig->id]);
+
+    Livewire::actingAs($user)
+        ->test(Edit::class, ['server' => $server])
+        ->set('form.ssh_config_mode', 'create')
+        ->set('form.ssh_host', 'other-bastion.example.com')
+        ->set('form.ssh_username', 'other_user')
+        ->set('form.ssh_password', 'other_password')
+        ->call('save')
+        ->assertHasNoErrors();
+
+    expect($server->fresh()->sshConfig)
+        ->id->not->toBe($sharedConfig->id)
+        ->host->toBe('other-bastion.example.com');
+    expect($sharedConfig->fresh())
+        ->host->toBe('bastion.example.com')
+        ->password->toBe('ssh_password');
+    expect($otherServer->fresh()->ssh_config_id)->toBe($sharedConfig->id);
+});
+
+test('choosing "Create new" when editing a server requires the new SSH credential', function () {
+    $user = User::factory()->withAbilities([Ability::ManageDatabaseServers->value])->create();
+    $server = DatabaseServer::factory()->withSshTunnel()->create(['database_names' => ['mydb']]);
+
+    Livewire::actingAs($user)
+        ->test(Edit::class, ['server' => $server])
+        ->set('form.ssh_config_mode', 'create')
+        ->set('form.ssh_host', 'other-bastion.example.com')
+        ->set('form.ssh_username', 'other_user')
+        ->call('save')
+        ->assertHasErrors(['form.ssh_password' => 'required']);
+});
+
+test('generateSshKey populates private and public key fields with a comment derived from server name', function () {
+    $user = User::factory()->withAbilities([Ability::ManageDatabaseServers->value])->create();
+
+    $component = Livewire::actingAs($user)
+        ->test(Create::class)
+        ->set('form.name', 'Prod MySQL')
+        ->set('form.ssh_enabled', true)
+        ->set('form.ssh_auth_type', 'key')
+        ->call('generateSshKey');
+
+    $privateKey = $component->get('form.ssh_private_key');
+    $publicKey = $component->get('form.ssh_public_key');
+
+    expect($privateKey)->toStartWith('-----BEGIN OPENSSH PRIVATE KEY-----');
+    expect($publicKey)->toMatch('/^ssh-ed25519 [A-Za-z0-9+\/=]+ databasement:prod-mysql$/');
+});
+
+test('generateSshKey falls back to host when name is empty', function () {
+    $user = User::factory()->withAbilities([Ability::ManageDatabaseServers->value])->create();
+
+    $component = Livewire::actingAs($user)
+        ->test(Create::class)
+        ->set('form.ssh_enabled', true)
+        ->set('form.ssh_auth_type', 'key')
+        ->set('form.ssh_host', 'bastion.example.com')
+        ->call('generateSshKey');
+
+    expect($component->get('form.ssh_public_key'))
+        ->toMatch('/databasement:bastion-example-com$/');
+});
+
+test('generateSshKey is a no-op when auth type is password', function () {
+    $user = User::factory()->withAbilities([Ability::ManageDatabaseServers->value])->create();
+
+    Livewire::actingAs($user)
+        ->test(Create::class)
+        ->set('form.ssh_enabled', true)
+        ->set('form.ssh_auth_type', 'password')
+        ->call('generateSshKey')
+        ->assertSet('form.ssh_private_key', '')
+        ->assertSet('form.ssh_public_key', '');
+});
+
+test('generateSshKey replaces any existing key in the form', function () {
+    // The blade uses wire:confirm to require explicit user approval before
+    // overwriting; the action itself should perform the overwrite once called.
+    $user = User::factory()->withAbilities([Ability::ManageDatabaseServers->value])->create();
+
+    $component = Livewire::actingAs($user)
+        ->test(Create::class)
+        ->set('form.ssh_enabled', true)
+        ->set('form.ssh_auth_type', 'key')
+        ->set('form.ssh_private_key', 'previous-key-contents')
+        ->call('generateSshKey');
+
+    expect($component->get('form.ssh_private_key'))
+        ->toStartWith('-----BEGIN OPENSSH PRIVATE KEY-----');
+    expect($component->get('form.ssh_public_key'))
+        ->toStartWith('ssh-ed25519 ');
+});
+
+test('testSshConnection calls form method', function () {
+    $user = User::factory()->withAbilities([Ability::ManageDatabaseServers->value])->create();
+    $server = DatabaseServer::factory()->withSshTunnel()->create();
+
+    // Calling testSshConnection should update form state
+    // The actual test will fail (no real SSH server) but the code path is exercised
+    Livewire::actingAs($user)
+        ->test(Edit::class, ['server' => $server])
+        ->set('form.ssh_enabled', true)
+        ->set('form.ssh_host', 'nonexistent.invalid.host')
+        ->set('form.ssh_port', 22)
+        ->set('form.ssh_username', 'testuser')
+        ->set('form.ssh_password', 'testpass')
+        ->call('testSshConnection')
+        ->assertSet('form.testingSshConnection', false)
+        ->assertSet('form.sshTestSuccess', false);
+});
+
+test('a validation error on a hidden SSH field expands the SSH editor', function () {
+    $user = User::factory()->withAbilities([Ability::ManageDatabaseServers->value])->create();
+    $volume = Volume::factory()->local()->create();
+
+    // "Use existing" collapses the SSH editor, so the required host/port/username
+    // rules would otherwise fail against fields the user cannot see.
+    $html = Livewire::actingAs($user)
+        ->test(Create::class)
+        ->set('form.name', 'Bastion Server')
+        ->set('form.database_type', 'mysql')
+        ->set('form.host', 'private-db.internal')
+        ->set('form.port', 3306)
+        ->set('form.username', 'dbuser')
+        ->set('form.password', 'secret123')
+        ->set('form.backups.0.volume_ids', [$volume->id])
+        ->set('form.backups.0.backup_schedule_id', dailySchedule()->id)
+        ->set('form.backups.0.retention_days', 14)
+        ->set('form.backups.0.database_names.0', 'myapp_production')
+        ->set('form.ssh_enabled', true)
+        ->set('form.ssh_config_mode', 'existing')
+        ->call('save')
+        ->assertHasErrors('form.ssh_host')
+        ->assertDispatched('validation-failed', field: 'form.ssh_host')
+        ->html();
+
+    expect($html)->toContain('showForm: true');
+});
+
+test('the SSH test does not reuse the stored passphrase for a replacement key', function () {
+    $user = User::factory()->withAbilities([Ability::ManageDatabaseServers->value])->create();
+    $server = DatabaseServer::factory()->create();
+    $sshConfig = DatabaseServerSshConfig::factory()->withKeyAuthAndPassphrase()->create();
+    $server->update(['ssh_config_id' => $sshConfig->id]);
+
+    $this->mock(SshTunnelService::class)
+        ->shouldReceive('testConnection')
+        ->once()
+        ->withArgs(fn (DatabaseServerSshConfig $config): bool => $config->private_key === 'NEW_KEY' && blank($config->key_passphrase))
+        ->andReturn(['success' => true, 'message' => 'ok']);
+
+    Livewire::actingAs($user)
+        ->test(Edit::class, ['server' => $server])
+        ->set('form.ssh_private_key', 'NEW_KEY')
+        ->call('testSshConnection')
+        ->assertSet('form.sshTestSuccess', true);
+});
+
+test('a failed SSH test says which field is wrong', function () {
+    $user = User::factory()->withAbilities([Ability::ManageDatabaseServers->value])->create();
+
+    Livewire::actingAs($user)
+        ->test(Create::class)
+        ->set('form.database_type', 'mysql')
+        ->set('form.ssh_enabled', true)
+        ->set('form.ssh_config_mode', 'create')
+        ->set('form.ssh_host', 'bastion.example.com')
+        ->set('form.ssh_username', 'deploy')
+        ->set('form.ssh_auth_type', 'key')
+        ->call('testSshConnection')
+        ->assertSet('form.sshTestSuccess', false)
+        // A generic "fill in the required fields" hides which one, and why.
+        ->assertSet('form.sshTestMessage', 'The ssh private key field is required.')
+        // Testing the connection points at the offending field the same way
+        // submitting the form does.
+        ->assertHasErrors('form.ssh_private_key')
+        ->assertDispatched('validation-failed', field: 'form.ssh_private_key');
+});

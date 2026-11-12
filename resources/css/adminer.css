@@ -1,0 +1,13 @@
+/* Loaded on top of Adminer's default.css: official Hever design + Databasement overrides */
+@import '../../vendor/vrana/adminer-design-hever/adminer.css';
+
+/* ── Hide branding, logout, language picker and the driver/login breadcrumb ── */
+#menu h1 { display: none !important; }
+#foot > form:last-child { display: none !important; }
+#lang { display: none !important; }
+#breadcrumb a:first-of-type { display: none !important; }
+
+/* default.css pushes the menu down to make room for the hidden language picker */
+@media not all and (max-width: 800px) {
+    #menu { top: 0; }
+}

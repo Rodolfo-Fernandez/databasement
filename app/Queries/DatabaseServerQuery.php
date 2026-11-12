@@ -1,0 +1,78 @@
+<?php
+
+namespace App\Queries;
+
+use App\Models\DatabaseServer;
+use App\Models\Restore;
+use App\Models\Snapshot;
+use App\Support\Formatters;
+use Illuminate\Database\Eloquent\Builder;
+use Spatie\QueryBuilder\AllowedFilter;
+use Spatie\QueryBuilder\AllowedSort;
+use Spatie\QueryBuilder\QueryBuilder;
+
+class DatabaseServerQuery
+{
+    private const ALLOWED_SORT_COLUMNS = [
+        'name',
+        'host',
+        'database_type',
+        'created_at',
+    ];
+
+    /**
+     * @return QueryBuilder<DatabaseServer>
+     */
+    public static function make(): QueryBuilder
+    {
+        return QueryBuilder::for(DatabaseServer::class)
+            ->with(['backups.volumes', 'backups.backupSchedule', 'sshConfig', 'notificationChannels'])
+            ->allowedFilters(
+                AllowedFilter::partial('name'),
+                AllowedFilter::partial('host'),
+                AllowedFilter::exact('database_type'),
+                AllowedFilter::partial('description'),
+                AllowedFilter::exact('managed_by'),
+            )
+            ->allowedSorts(
+                AllowedSort::field('name'),
+                AllowedSort::field('host'),
+                AllowedSort::field('database_type'),
+                AllowedSort::field('created_at'),
+            )
+            ->defaultSort('-created_at');
+    }
+
+    /**
+     * Build query from manual parameters (for Livewire).
+     *
+     * @return Builder<DatabaseServer>
+     */
+    public static function buildFromParams(
+        ?string $search = null,
+        string $sortColumn = 'created_at',
+        string $sortDirection = 'desc'
+    ): Builder {
+        $sortColumn = Formatters::sortColumn($sortColumn, self::ALLOWED_SORT_COLUMNS);
+
+        return DatabaseServer::query()
+            ->with(['backups.volumes', 'backups.backupSchedule', 'sshConfig', 'agent', 'notificationChannels'])
+            ->withCount(['snapshots' => function (Builder $q) {
+                /** @var Builder<Snapshot> $q */
+                return $q->completed();
+            }])
+            ->addSelect([
+                'restores_count' => Restore::selectRaw('count(*)')
+                    ->whereColumn('target_server_id', 'database_servers.id'),
+            ])
+            ->when($search, function (Builder $query) use ($search) {
+                $query->where(function (Builder $q) use ($search) {
+                    $q->where('name', 'like', "%{$search}%")
+                        ->orWhere('host', 'like', "%{$search}%")
+                        ->orWhere('database_type', 'like', "%{$search}%")
+                        ->orWhere('description', 'like', "%{$search}%");
+                });
+            })
+            ->orderBy($sortColumn, Formatters::sortDirection($sortDirection));
+    }
+}

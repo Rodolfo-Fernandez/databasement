@@ -1,0 +1,87 @@
+<?php
+
+namespace App\Services;
+
+use App\Models\AppConfig;
+
+class AppConfigService
+{
+    /**
+     * Config key definitions: type, sensitivity, and default value.
+     *
+     * Used for fallback defaults (pre-migration) and auto-creating rows on `set()`.
+     *
+     * @var array<string, array{type: string, is_sensitive: bool, default: mixed}>
+     */
+    private const array CONFIG = [
+        'app.adminer_enabled' => ['type' => 'boolean', 'is_sensitive' => false, 'default' => true],
+        'backup.working_directory' => ['type' => 'string', 'is_sensitive' => false, 'default' => '/tmp/backups'],
+        'backup.compression' => ['type' => 'string', 'is_sensitive' => false, 'default' => 'gzip'],
+        'backup.compression_level' => ['type' => 'integer', 'is_sensitive' => false, 'default' => 6],
+        'backup.compression_multithread' => ['type' => 'boolean', 'is_sensitive' => false, 'default' => false],
+        'backup.job_timeout' => ['type' => 'integer', 'is_sensitive' => false, 'default' => 7200],
+        'backup.job_tries' => ['type' => 'integer', 'is_sensitive' => false, 'default' => 3],
+        'backup.job_backoff' => ['type' => 'integer', 'is_sensitive' => false, 'default' => 60],
+        'backup.cleanup_cron' => ['type' => 'string', 'is_sensitive' => false, 'default' => '0 4 * * *'],
+        'backup.verify_files' => ['type' => 'boolean', 'is_sensitive' => false, 'default' => true],
+        'backup.verify_files_cron' => ['type' => 'string', 'is_sensitive' => false, 'default' => '0 5 * * *'],
+        'backup.post_backup_script' => ['type' => 'string', 'is_sensitive' => false, 'default' => ''],
+        'backup.post_restore_script' => ['type' => 'string', 'is_sensitive' => false, 'default' => ''],
+    ];
+
+    /**
+     * Get a config value by key.
+     *
+     * Checks DB first, then falls back to CONFIG defaults.
+     */
+    public function get(string $key, mixed $default = null): mixed
+    {
+        try {
+            $row = AppConfig::find($key);
+
+            if ($row) {
+                return $row->getCastedValue();
+            }
+        } catch (\Throwable) {
+            // Table may not exist yet (pre-migration) — fall through to defaults
+        }
+
+        return $default ?? self::CONFIG[$key]['default'] ?? null;
+    }
+
+    /**
+     * Set a config value by key.
+     *
+     * Auto-creates the row from CONFIG if it doesn't exist yet.
+     */
+    public function set(string $key, mixed $value): void
+    {
+        if (is_string($value)) {
+            $value = trim($value);
+        }
+
+        if (! array_key_exists($key, self::CONFIG)) {
+            throw new \InvalidArgumentException("Unknown config key [{$key}]. Add it to AppConfigService::CONFIG.");
+        }
+
+        $schema = self::CONFIG[$key];
+
+        AppConfig::updateOrCreate(
+            ['id' => $key],
+            [
+                'value' => AppConfig::prepareValue($value, $schema['is_sensitive']),
+                'type' => $schema['type'],
+                'is_sensitive' => $schema['is_sensitive'],
+            ]
+        );
+    }
+
+    public function ensureBackupTmpFolderExists(): void
+    {
+        $backupTmpFolder = self::get('backup.working_directory');
+
+        if ($backupTmpFolder && ! is_dir($backupTmpFolder)) {
+            mkdir($backupTmpFolder, 0755, true);
+        }
+    }
+}

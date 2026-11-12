@@ -1,0 +1,58 @@
+<?php
+
+namespace App\Livewire\Settings;
+
+use App\Traits\Toast;
+use Illuminate\Contracts\View\View;
+use Illuminate\Support\Facades\Auth;
+use Illuminate\Validation\Rules\Password as PasswordRule;
+use Illuminate\Validation\ValidationException;
+use Livewire\Attributes\Title;
+use Livewire\Component;
+
+#[Title('Password')]
+class Password extends Component
+{
+    use Toast;
+
+    public string $current_password = '';
+
+    public string $password = '';
+
+    public string $password_confirmation = '';
+
+    public function mount(): void
+    {
+        // OAuth-only users don't have a password to change
+        if (Auth::user()->isOAuth()) {
+            abort(403, __('Password settings are not available for OAuth users.'));
+        }
+    }
+
+    public function updatePassword(): void
+    {
+        try {
+            $validated = $this->validate([
+                'current_password' => ['required', 'string', 'current_password'],
+                'password' => ['required', 'string', PasswordRule::defaults(), 'confirmed'],
+            ]);
+        } catch (ValidationException $e) {
+            $this->reset('current_password', 'password', 'password_confirmation');
+
+            throw $e;
+        }
+
+        Auth::user()->update([
+            'password' => $validated['password'],
+        ]);
+
+        $this->reset('current_password', 'password', 'password_confirmation');
+
+        $this->success(__('Password updated successfully.'));
+    }
+
+    public function render(): View
+    {
+        return view('livewire.settings.password');
+    }
+}

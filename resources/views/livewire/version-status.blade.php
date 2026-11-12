@@ -1,0 +1,182 @@
+<div class="inline-flex">
+    {{-- Footer trigger --}}
+    @if($latestVersion && $appVersion && ! $this->isUpToDate())
+        {{-- Update available — eye-catching pill --}}
+        <button
+            wire:click="open"
+            wire:loading.attr="disabled"
+            wire:target="open"
+            class="inline-flex items-center gap-1.5 cursor-pointer rounded-full px-2 py-0.5 bg-warning/10 border border-warning/20 text-warning text-sm font-medium hover:bg-warning/20 hover:border-warning/35 transition-all"
+            title="{{ $latestVersion }} {{ __('available') }}"
+        >
+            <x-loading wire:loading wire:target="open" class="loading-spinner loading-xs" />
+            <span wire:loading.remove wire:target="open" class="relative flex h-1.5 w-1.5 shrink-0">
+                <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-warning opacity-60"></span>
+                <span class="relative inline-flex rounded-full h-1.5 w-1.5 bg-warning"></span>
+            </span>
+            {{ $latestVersion }} {{ __('available') }}
+        </button>
+    @elseif($appVersion || $appCommitHash)
+        {{-- Up to date or no latest info — subtle version with green dot --}}
+        <button
+            wire:click="open"
+            wire:loading.attr="disabled"
+            wire:target="open"
+            class="inline-flex items-center gap-1.5 text-sm text-base-content/60 hover:text-base-content transition-colors cursor-pointer"
+        >
+            <x-loading wire:loading wire:target="open" class="loading-spinner loading-xs" />
+            @if($this->isUpToDate())
+                <span wire:loading.remove wire:target="open" class="flex h-1.5 w-1.5 shrink-0">
+                    <span class="block h-full w-full rounded-full bg-success opacity-70"></span>
+                </span>
+            @endif
+            <span class="font-mono">
+                {{ $appVersion ?: $appCommitHash }}
+            </span>
+        </button>
+    @else
+        {{-- No version info — plain link --}}
+        <button
+            wire:click="open"
+            wire:loading.attr="disabled"
+            wire:target="open"
+            class="inline-flex items-center gap-1.5 link link-hover text-sm text-base-content/60"
+        >
+            <x-loading wire:loading wire:target="open" class="loading-spinner loading-xs" />
+            {{ __('How to update?') }}
+        </button>
+    @endif
+
+    {{-- Modal --}}
+    <x-modal wire:model="showModal" :title="__('How to update?')" class="backdrop-blur" box-class="max-w-2xl">
+        {{-- Version status --}}
+        @if($latestVersion && $appVersion && $this->isUpToDate())
+            <x-alert icon="o-check-circle" class="alert-success mb-4">
+                {{ __('You are running the latest version') }}
+                <a href="{{ $releaseUrl }}" target="_blank" rel="noopener" class="font-mono font-semibold link">{{ $latestVersion }}</a>
+            </x-alert>
+        @elseif($latestVersion && $appVersion)
+            <x-alert icon="o-arrow-path" class="alert-warning mb-4">
+                <span class="inline-flex items-center gap-1.5 flex-wrap">
+                    {{ __('Update available:') }}
+                    <span class="font-mono">
+                        {{ $appVersion }}
+                    </span>
+                    <x-icon name="o-arrow-right" class="w-3.5 h-3.5" />
+                    <a href="{{ $releaseUrl }}" target="_blank" rel="noopener" class="font-mono font-bold link">{{ $latestVersion }}</a>
+                </span>
+            </x-alert>
+        @elseif($latestVersion && !$appVersion)
+            <x-alert icon="o-exclamation-triangle" class="alert-warning mb-4">
+                {{ __('Could not determine current version.') }}
+                {{ __('Latest available:') }}
+                <a href="{{ $releaseUrl }}" target="_blank" rel="noopener" class="font-mono font-semibold link">{{ $latestVersion }}</a>
+            </x-alert>
+            <x-alert icon="o-information-circle" class="alert-info mb-4">
+                {{ __('You are not using a version tag. Consider using docker tag "1" instead of "latest" for reliable update detection.') }}
+            </x-alert>
+        @elseif($appVersion && !$latestVersion)
+            <x-alert icon="o-exclamation-triangle" class="alert-warning mb-4">
+                {{ __('Could not determine latest version, check yourself on GitHub.') }}
+                {{ __('Current version:') }}
+                <span class="font-mono font-semibold">{{ $appVersion }}</span>
+            </x-alert>
+        @else
+            <x-alert icon="o-exclamation-triangle" class="alert-warning mb-4">
+                {{ __('Could not determine version information.') }}
+            </x-alert>
+        @endif
+
+        @if($appCommitHash)
+            <x-alert class="alert-info mb-4">
+                {{ __('Current commit hash:') }}
+                <span class="font-mono font-semibold">
+                    <a href="{{ config('app.github_repo') }}/commit/{{ $appCommitHash }}" target="_blank" rel="noopener" class="link">
+                        {{ $appCommitHash }}
+                    </a>
+                </span>
+            </x-alert>
+        @endif
+
+        <p class="mb-4 text-sm">
+            <a href="{{ route('changelog') }}" class="link link-primary">
+                {{ __('See what changed in each release') }}
+            </a>
+        </p>
+
+        <div class="tabs tabs-border tabs-sm">
+
+            {{-- Docker Compose tab --}}
+            <label class="tab gap-2">
+                <input type="radio" name="update-instructions" checked/>
+                <x-icon name="devicon.docker"/>
+                {{ __('Docker Compose') }}
+            </label>
+            <div class="tab-content px-3 py-5">
+                <div class="flex items-center justify-between mb-1.5">
+                    <p class="text-sm opacity-70">
+                        {{ __('Run from the folder where your docker-compose.yml is located') }}
+                    </p>
+                    <x-button
+                        icon="o-clipboard-document"
+                        class="btn-ghost btn-xs"
+                        :label="__('Copy')"
+                        x-clipboard="$wire.dockerComposeCommand"
+                        x-on:clipboard-copied="successToast('{{ __('Copied to clipboard!') }}')"
+                    />
+                </div>
+                <pre class="bg-neutral text-neutral-content rounded-box p-5 text-sm overflow-x-auto"><code class="break-all select-all whitespace-pre-wrap">{{ $dockerComposeCommand }}</code></pre>
+            </div>
+
+            {{-- Helm / Kubernetes tab --}}
+            <label class="tab gap-2">
+                <input type="radio" name="update-instructions"/>
+                <x-icon name="devicon.kubernetes"/>
+                {{ __('Helm / Kubernetes') }}
+            </label>
+            <div class="tab-content px-3 py-5">
+                <div class="flex items-center justify-between mb-1.5">
+                    <p class="text-sm opacity-70">
+                        {{ __('Update the Helm repository and upgrade the release') }}
+                    </p>
+                    <x-button
+                        icon="o-clipboard-document"
+                        class="btn-ghost btn-xs"
+                        :label="__('Copy')"
+                        x-clipboard="$wire.helmCommand"
+                        x-on:clipboard-copied="successToast('{{ __('Copied to clipboard!') }}')"
+                    />
+                </div>
+                <pre class="bg-neutral text-neutral-content rounded-box p-5 text-sm overflow-x-auto"><code class="break-all select-all whitespace-pre-wrap">{{ $helmCommand }}</code></pre>
+            </div>
+
+            {{-- Docker tab --}}
+            <label class="tab gap-2">
+                <input type="radio" name="update-instructions"/>
+                <x-icon name="devicon.docker"/>
+                {{ __('Docker') }}
+            </label>
+            <div class="tab-content px-3 py-5">
+                <div class="flex items-center justify-between mb-1.5">
+                    <p class="text-sm opacity-70">
+                        {{ __('Run from the folder where your .env file is located') }}
+                    </p>
+                    <x-button
+                        icon="o-clipboard-document"
+                        class="btn-ghost btn-xs"
+                        :label="__('Copy')"
+                        x-clipboard="$wire.dockerCommand"
+                        x-on:clipboard-copied="successToast('{{ __('Copied to clipboard!') }}')"
+                    />
+                </div>
+                <pre class="bg-neutral text-neutral-content rounded-box p-5 text-sm overflow-x-auto"><code class="break-all select-all whitespace-pre-wrap">{{ $dockerCommand }}</code></pre>
+            </div>
+
+        </div>
+
+        <x-slot:actions>
+            <x-button :label="__('Done')" class="btn-primary" @click="$wire.showModal = false" />
+        </x-slot:actions>
+
+    </x-modal>
+</div>

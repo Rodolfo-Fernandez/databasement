@@ -1,0 +1,179 @@
+<?php
+
+namespace App\Models;
+
+use App\Enums\DatabaseSelectionMode;
+use App\Support\Formatters;
+use Database\Factories\BackupFactory;
+use Illuminate\Database\Eloquent\Concerns\HasUlids;
+use Illuminate\Database\Eloquent\Factories\HasFactory;
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\BelongsTo;
+use Illuminate\Database\Eloquent\Relations\BelongsToMany;
+use Illuminate\Database\Eloquent\Relations\HasMany;
+
+/**
+ * @mixin IdeHelperBackup
+ */
+class Backup extends Model
+{
+    /** @use HasFactory<BackupFactory> */
+    use HasFactory;
+
+    use HasUlids;
+
+    public const string RETENTION_DAYS = 'days';
+
+    public const string RETENTION_GFS = 'gfs';
+
+    public const string RETENTION_FOREVER = 'forever';
+
+    public const array RETENTION_POLICIES = [
+        self::RETENTION_DAYS,
+        self::RETENTION_GFS,
+        self::RETENTION_FOREVER,
+    ];
+
+    protected $fillable = [
+        'database_server_id',
+        'path',
+        'backup_schedule_id',
+        'retention_days',
+        'retention_policy',
+        'gfs_keep_daily',
+        'gfs_keep_weekly',
+        'gfs_keep_monthly',
+        'database_selection_mode',
+        'database_names',
+        'database_include_pattern',
+        'excluded_tables',
+    ];
+
+    protected function casts(): array
+    {
+        return [
+            'database_selection_mode' => DatabaseSelectionMode::class,
+            'database_names' => 'array',
+            'excluded_tables' => 'array',
+            'retention_days' => 'integer',
+            'gfs_keep_daily' => 'integer',
+            'gfs_keep_weekly' => 'integer',
+            'gfs_keep_monthly' => 'integer',
+        ];
+    }
+
+    /**
+     * One-line summary of the backup config for the index table, logs, and tooltips.
+     *
+     * @param  bool  $toString  When false, returns an associative array of parts.
+     * @return ($toString is false ? array{schedule: string, volume: string, databases: string, retention: string} : string)
+     */
+    public function getDisplayLabel(bool $toString = true): string|array
+    {
+        $parts = [
+            'schedule' => $this->backupSchedule->name,
+            'volume' => $this->volumes->pluck('name')->implode(', '),
+            'databases' => $this->getDatabaseSummary(),
+            'retention' => $this->getRetentionSummary(),
+        ];
+
+        if (! $toString) {
+            return $parts;
+        }
+
+        return implode(' · ', array_filter([
+            $parts['schedule'].' → '.$parts['volume'],
+            $parts['databases'],
+            $parts['retention'],
+        ]));
+    }
+
+    /**
+     * Short description of which databases this config backs up.
+     */
+    public function getDatabaseSummary(): string
+    {
+        $isSqlite = $this->databaseServer->database_type->value === 'sqlite';
+
+        if ($isSqlite) {
+            return Formatters::truncatedList(array_map('basename', $this->database_names ?? []), 2);
+        }
+
+        return match ($this->database_selection_mode) {
+            DatabaseSelectionMode::All => __('All databases'),
+            DatabaseSelectionMode::Selected => Formatters::truncatedList($this->database_names ?? [], 2),
+            DatabaseSelectionMode::Pattern => '/'.$this->database_include_pattern.'/',
+        };
+    }
+
+    /**
+     * Normalize excluded table names into a clean list.
+     *
+     * Accepts the form's comma- or newline-separated textarea string as well
+     * as an already-structured array (REST API). Blank entries and duplicates
+     * are dropped; names are validated by {@see \App\Rules\ExcludedTableNames}.
+     *
+     * @return list<string>
+     */
+    public static function parseExcludedTables(mixed $value): array
+    {
+        if (is_string($value)) {
+            $value = preg_split('/[,\r\n]+/', $value) ?: [];
+        }
+
+        if (! is_array($value)) {
+            return [];
+        }
+
+        $names = array_map(trim(...), array_filter($value, is_string(...)));
+
+        return array_values(array_unique(array_filter($names, fn (string $name): bool => $name !== '')));
+    }
+
+    /**
+     * Short retention label: "30d", "GFS 7d/4w/3m", or "Forever".
+     */
+    public function getRetentionSummary(): string
+    {
+        return match ($this->retention_policy) {
+            self::RETENTION_GFS => 'GFS '.($this->gfs_keep_daily ?? 0).'d/'.($this->gfs_keep_weekly ?? 0).'w/'.($this->gfs_keep_monthly ?? 0).'m',
+            self::RETENTION_FOREVER => __('Forever'),
+            default => $this->retention_days ? $this->retention_days.'d' : '',
+        };
+    }
+
+    /**
+     * @return BelongsTo<DatabaseServer, Backup>
+     */
+    public function databaseServer(): BelongsTo
+    {
+        return $this->belongsTo(DatabaseServer::class);
+    }
+
+    /**
+     * The storage volumes this backup uploads to. The database is dumped once
+     * per run and the archive is transferred to every attached volume.
+     *
+     * @return BelongsToMany<Volume, Backup>
+     */
+    public function volumes(): BelongsToMany
+    {
+        return $this->belongsToMany(Volume::class);
+    }
+
+    /**
+     * @return BelongsTo<BackupSchedule, Backup>
+     */
+    public function backupSchedule(): BelongsTo
+    {
+        return $this->belongsTo(BackupSchedule::class);
+    }
+
+    /**
+     * @return HasMany<Snapshot, Backup>
+     */
+    public function snapshots(): HasMany
+    {
+        return $this->hasMany(Snapshot::class);
+    }
+}

@@ -1,0 +1,709 @@
+<?php
+
+use App\Actions\Backup\RecordBackupResultAction;
+use App\Enums\AgentJobType;
+use App\Enums\BackupJobStatus;
+use App\Enums\SnapshotFileStatus;
+use App\Http\Middleware\ThrottleFailedAgentAuth;
+use App\Models\Agent;
+use App\Models\AgentJob;
+use App\Models\DatabaseServer;
+use App\Models\Snapshot;
+use App\Models\User;
+use App\Services\Backup\DTO\BackupResult;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Notification;
+use Illuminate\Support\Facades\RateLimiter;
+
+/**
+ * Helper to create an agent and return it with a plain text token.
+ *
+ * @return array{agent: Agent, token: string}
+ */
+function createAgentWithToken(): array
+{
+    $agent = Agent::factory()->create();
+    $token = $agent->createToken('agent');
+
+    return ['agent' => $agent, 'token' => $token->plainTextToken];
+}
+
+describe('agent authentication', function () {
+    test('unauthenticated requests are rejected', function () {
+        $this->postJson('/api/v1/agent/heartbeat')
+            ->assertUnauthorized();
+    });
+
+    test('user tokens are rejected by agent middleware', function () {
+        $user = User::factory()->create();
+
+        $this->actingAs($user, 'sanctum')
+            ->postJson('/api/v1/agent/heartbeat')
+            ->assertForbidden();
+    });
+
+    test('agent tokens are rejected by the user api', function () {
+        ['token' => $token] = createAgentWithToken();
+        createDatabaseServer();
+
+        $this->withToken($token)
+            ->getJson('/api/v1/database-servers')
+            ->assertForbidden()
+            ->assertJsonMissingPath('data');
+    });
+
+    test('agent tokens are rejected by the mcp endpoint', function () {
+        ['token' => $token] = createAgentWithToken();
+
+        $this->withToken($token)
+            ->withHeaders(['Accept' => 'application/json, text/event-stream'])
+            ->postJson('/mcp', [
+                'jsonrpc' => '2.0',
+                'id' => 1,
+                'method' => 'tools/list',
+            ])
+            ->assertForbidden();
+    });
+
+    test('agent tokens are accepted', function () {
+        ['token' => $token] = createAgentWithToken();
+
+        $this->withToken($token)
+            ->postJson('/api/v1/agent/heartbeat')
+            ->assertOk();
+    });
+});
+
+describe('agent heartbeat', function () {
+    test('updates last_heartbeat_at', function () {
+        ['agent' => $agent, 'token' => $token] = createAgentWithToken();
+
+        expect($agent->last_heartbeat_at)->toBeNull();
+
+        $this->withToken($token)
+            ->postJson('/api/v1/agent/heartbeat')
+            ->assertOk();
+
+        expect($agent->fresh()->last_heartbeat_at)->not->toBeNull();
+    });
+
+    test('records the version the agent reports', function (array $headers, ?string $version, ?string $commit) {
+        ['agent' => $agent, 'token' => $token] = createAgentWithToken();
+        $agent->update(['version' => '1.0.0', 'commit_hash' => 'fffffff']);
+
+        $this->withToken($token)
+            ->withHeaders($headers)
+            ->postJson('/api/v1/agent/heartbeat')
+            ->assertOk();
+
+        expect($agent->fresh())
+            ->version->toBe($version)
+            ->commit_hash->toBe($commit);
+    })->with([
+        'tagged build' => [['X-Databasement-Version' => 'v1.9.2', 'X-Databasement-Commit' => 'A1B2C3D'], '1.9.2', 'a1b2c3d'],
+        'untagged build' => [['X-Databasement-Version' => 'dev', 'X-Databasement-Commit' => 'a1b2c3d'], 'dev', 'a1b2c3d'],
+        'unparseable values' => [['X-Databasement-Version' => '<script>', 'X-Databasement-Commit' => 'not-a-hash'], 'dev', null],
+        'agent predating version headers' => [[], null, null],
+    ]);
+});
+
+describe('job claiming', function () {
+    test('can claim a pending job', function () {
+        ['agent' => $agent, 'token' => $token] = createAgentWithToken();
+
+        $server = DatabaseServer::factory()->create(['agent_id' => $agent->id]);
+        $snapshot = Snapshot::factory()->forServer($server)->create();
+        $agentJob = AgentJob::factory()->create(['snapshot_id' => $snapshot->id]);
+
+        $response = $this->withToken($token)
+            ->postJson('/api/v1/agent/jobs/claim')
+            ->assertOk()
+            ->assertJsonPath('job.merges_logs', true);
+
+        $jobData = $response->json('job');
+        expect($jobData)->not->toBeNull()
+            ->and($jobData['id'])->toBe($agentJob->id);
+
+        $agentJob->refresh();
+        expect($agentJob->status)->toBe(AgentJob::STATUS_CLAIMED)
+            ->and($agentJob->agent_id)->toBe($agent->id)
+            ->and($agentJob->claimed_at)->not->toBeNull()
+            ->and($agentJob->lease_expires_at)->not->toBeNull();
+
+        // BackupJob should be marked as running with started_at set
+        $backupJob = $snapshot->job->fresh();
+        expect($backupJob->status)->toBe(BackupJobStatus::Running)
+            ->and($backupJob->started_at)->not->toBeNull();
+    });
+
+    test('returns null when no jobs available', function () {
+        ['token' => $token] = createAgentWithToken();
+
+        $this->withToken($token)
+            ->postJson('/api/v1/agent/jobs/claim')
+            ->assertOk()
+            ->assertJson(['job' => null]);
+    });
+
+    test('cannot claim jobs for servers not assigned to this agent', function () {
+        ['token' => $token] = createAgentWithToken();
+
+        // Job belongs to a server with no agent
+        $server = DatabaseServer::factory()->create();
+        $snapshot = Snapshot::factory()->forServer($server)->create();
+        AgentJob::factory()->create(['snapshot_id' => $snapshot->id]);
+
+        $this->withToken($token)
+            ->postJson('/api/v1/agent/jobs/claim')
+            ->assertOk()
+            ->assertJson(['job' => null]);
+    });
+
+    test('can claim an expired lease job', function () {
+        ['agent' => $agent, 'token' => $token] = createAgentWithToken();
+
+        $server = DatabaseServer::factory()->create(['agent_id' => $agent->id]);
+        $snapshot = Snapshot::factory()->forServer($server)->create();
+        $agentJob = AgentJob::factory()->expiredLease()->create([
+            'snapshot_id' => $snapshot->id,
+        ]);
+
+        $this->withToken($token)
+            ->postJson('/api/v1/agent/jobs/claim')
+            ->assertOk()
+            ->assertJsonPath('job.id', $agentJob->id);
+
+        $agentJob->refresh();
+        expect($agentJob->status)->toBe(AgentJob::STATUS_CLAIMED)
+            ->and($agentJob->attempts)->toBe(2); // Was 1 from factory, now incremented
+    });
+});
+
+describe('job heartbeat', function () {
+    test('a heartbeat merges logs: a command sent again replaces the running one, the rest is appended', function () {
+        ['agent' => $agent, 'token' => $token] = createAgentWithToken();
+        $agentJob = AgentJob::factory()->claimed($agent)->create();
+        $heartbeat = fn (array $logs) => $this->withToken($token)
+            ->postJson("/api/v1/agent/jobs/{$agentJob->id}/heartbeat", ['logs' => $logs])
+            ->assertOk();
+        $log = fn (string $message) => ['timestamp' => now()->toIso8601String(), 'type' => 'log', 'level' => 'info', 'message' => $message];
+        $command = fn (string $command, string $status, string $output = '') => ['timestamp' => now()->toIso8601String(), 'type' => 'command', 'command' => $command, 'status' => $status, 'output' => $output];
+
+        $heartbeat([$log('Starting backup'), $command('pg_dump app', 'running')]);
+        $heartbeat([$command('pg_dump app', 'running', 'line 1')]);
+        $heartbeat([$command('pg_dump app', 'completed', "line 1\nline 2"), $log('Dump done'), $command('gzip dump.sql', 'running')]);
+
+        expect(collect($agentJob->trackedJob()->fresh()->logs)->map(fn (array $entry) => $entry['message'] ?? "{$entry['command']} [{$entry['status']}] {$entry['output']}")->all())
+            ->toBe([
+                'Starting backup',
+                "pg_dump app [completed] line 1\nline 2",
+                'Dump done',
+                'gzip dump.sql [running] ',
+            ]);
+    });
+});
+
+describe('job acknowledgement', function () {
+    test('can ack a completed job', function () {
+        ['agent' => $agent, 'token' => $token] = createAgentWithToken();
+        $agentJob = AgentJob::factory()->claimed($agent)->create();
+
+        $logs = [
+            ['timestamp' => now()->toIso8601String(), 'type' => 'log', 'level' => 'info', 'message' => 'Starting backup for database: testdb'],
+            ['timestamp' => now()->toIso8601String(), 'type' => 'log', 'level' => 'success', 'message' => 'Backup completed successfully'],
+        ];
+
+        $this->withToken($token)
+            ->postJson("/api/v1/agent/jobs/{$agentJob->id}/ack", [
+                'filename' => 'backups/test-db-2026-02-20-120000.sql.gz',
+                'file_size' => 12345,
+                'checksum' => 'abc123sha256hash',
+                'logs' => $logs,
+            ])
+            ->assertOk();
+
+        $agentJob->refresh();
+        expect($agentJob->status)->toBe(AgentJob::STATUS_COMPLETED)
+            ->and($agentJob->completed_at)->not->toBeNull();
+
+        $snapshot = $agentJob->snapshot->fresh();
+        expect($snapshot->filename)->toBe('backups/test-db-2026-02-20-120000.sql.gz')
+            ->and($snapshot->file_size)->toBe(12345)
+            ->and($snapshot->checksum)->toBe('abc123sha256hash');
+
+        // BackupJob should be completed with logs written
+        $backupJob = $snapshot->job;
+        expect($backupJob->status)->toBe(BackupJobStatus::Completed)
+            ->and($backupJob->logs)->toHaveCount(2)
+            ->and($backupJob->logs[0]['message'])->toBe('Starting backup for database: testdb');
+    });
+
+    test('the storage warning an agent reports on a volume reaches the recorded result', function () {
+        ['agent' => $agent, 'token' => $token] = createAgentWithToken();
+        $agentJob = AgentJob::factory()->claimed($agent)->create();
+        $file = $agentJob->snapshot->files()->first();
+
+        RecordBackupResultAction::shouldRun()
+            ->once()
+            ->withArgs(fn (Snapshot $snapshot, BackupResult $result) => $result->volumeResults[0]->storageWarning === 'Storage limit reached for volume "R2 Bucket".');
+
+        $this->withToken($token)
+            ->postJson("/api/v1/agent/jobs/{$agentJob->id}/ack", [
+                'filename' => 'backup.sql.gz',
+                'file_size' => 12345,
+                'volumes' => [[
+                    'volume_id' => $file->volume_id,
+                    'volume_name' => 'R2 Bucket',
+                    'status' => 'completed',
+                    'storage_warning' => 'Storage limit reached for volume "R2 Bucket".',
+                ]],
+            ])
+            ->assertOk();
+    });
+
+    test('ack rejects an unsafe filename', function (string $filename) {
+        // An agent is lower-trust than the central server it reports to, so the
+        // filename it supplies must not reach the download path unsanitised.
+        ['agent' => $agent, 'token' => $token] = createAgentWithToken();
+        $agentJob = AgentJob::factory()->claimed($agent)->create();
+        $original = $agentJob->snapshot->filename;
+
+        $this->withToken($token)
+            ->postJson("/api/v1/agent/jobs/{$agentJob->id}/ack", [
+                'filename' => $filename,
+                'file_size' => 12345,
+            ])
+            ->assertStatus(422)
+            ->assertJsonValidationErrors('filename');
+
+        expect($agentJob->snapshot->fresh()->filename)->toBe($original);
+    })->with([
+        'traversal' => '../../../../etc/passwd',
+        'null byte' => "backups/test.sql.gz\0.php",
+    ]);
+
+    test('fail rejects an unsafe filename', function (string $filename) {
+        ['agent' => $agent, 'token' => $token] = createAgentWithToken();
+        $agentJob = AgentJob::factory()->claimed($agent)->create();
+
+        $this->withToken($token)
+            ->postJson("/api/v1/agent/jobs/{$agentJob->id}/fail", [
+                'error_message' => 'partial upload',
+                'filename' => $filename,
+                'file_size' => 12345,
+            ])
+            ->assertStatus(422)
+            ->assertJsonValidationErrors('filename');
+    })->with([
+        'traversal' => '/etc/passwd',
+        'null byte' => "backups/test.sql.gz\0.php",
+    ]);
+
+    test('ack records per-volume results on a multi-volume snapshot', function () {
+        ['agent' => $agent, 'token' => $token] = createAgentWithToken();
+
+        $volumeA = \App\Models\Volume::factory()->s3()->create();
+        $volumeB = \App\Models\Volume::factory()->s3()->create();
+        $snapshot = \App\Models\Snapshot::factory()->onVolumes($volumeA, $volumeB)->create(['filename' => '']);
+        $snapshot->files()->update(['status' => SnapshotFileStatus::Pending]);
+        $agentJob = AgentJob::factory()->claimed($agent)->create(['snapshot_id' => $snapshot->id]);
+
+        $this->withToken($token)
+            ->postJson("/api/v1/agent/jobs/{$agentJob->id}/ack", [
+                'filename' => 'multi.sql.gz',
+                'file_size' => 2048,
+                'checksum' => 'sha',
+                'volumes' => [
+                    ['volume_id' => $volumeA->id, 'status' => SnapshotFileStatus::Completed->value],
+                    ['volume_id' => $volumeB->id, 'status' => SnapshotFileStatus::Completed->value],
+                ],
+            ])
+            ->assertOk();
+
+        $snapshot->refresh();
+        expect($snapshot->job->status)->toBe(BackupJobStatus::Completed)
+            ->and($snapshot->files()->completed()->count())->toBe(2)
+            ->and($snapshot->filename)->toBe('multi.sql.gz');
+    });
+
+    test('legacy ack without volume results fails a multi-volume job but completes a single-volume one', function () {
+        ['agent' => $agent, 'token' => $token] = createAgentWithToken();
+
+        // Multi-volume snapshot acked by an old agent: only the first copy was
+        // uploaded, so the job fails and the remaining copy is marked failed.
+        $volumeA = \App\Models\Volume::factory()->s3()->create();
+        $volumeB = \App\Models\Volume::factory()->s3()->create();
+        $snapshot = \App\Models\Snapshot::factory()->onVolumes($volumeA, $volumeB)->create(['filename' => '']);
+        $snapshot->files()->update(['status' => SnapshotFileStatus::Pending]);
+        $agentJob = AgentJob::factory()->claimed($agent)->create(['snapshot_id' => $snapshot->id]);
+
+        $this->withToken($token)
+            ->postJson("/api/v1/agent/jobs/{$agentJob->id}/ack", [
+                'filename' => 'legacy.sql.gz',
+                'file_size' => 1024,
+            ])
+            ->assertOk();
+
+        $snapshot->refresh();
+        expect($snapshot->job->status)->toBe(BackupJobStatus::Failed)
+            ->and($snapshot->files()->completed()->count())->toBe(1)
+            ->and($snapshot->files()->where('status', SnapshotFileStatus::Failed)->first()->error)
+            ->toContain('update the agent');
+    });
+
+    test('fail with per-volume results records the successful copies', function () {
+        ['agent' => $agent, 'token' => $token] = createAgentWithToken();
+
+        $volumeA = \App\Models\Volume::factory()->s3()->create();
+        $volumeB = \App\Models\Volume::factory()->s3()->create();
+        $snapshot = \App\Models\Snapshot::factory()->onVolumes($volumeA, $volumeB)->create(['filename' => '']);
+        $snapshot->files()->update(['status' => SnapshotFileStatus::Pending]);
+        $agentJob = AgentJob::factory()->claimed($agent)->create(['snapshot_id' => $snapshot->id]);
+
+        $this->withToken($token)
+            ->postJson("/api/v1/agent/jobs/{$agentJob->id}/fail", [
+                'error_message' => 'Upload failed for volume(s): B',
+                'filename' => 'partial.sql.gz',
+                'file_size' => 4096,
+                'volumes' => [
+                    ['volume_id' => $volumeA->id, 'status' => SnapshotFileStatus::Completed->value],
+                    ['volume_id' => $volumeB->id, 'status' => SnapshotFileStatus::Failed->value, 'error' => 'S3 unreachable'],
+                ],
+            ])
+            ->assertOk();
+
+        $snapshot->refresh();
+        expect($snapshot->job->status)->toBe(BackupJobStatus::Failed)
+            ->and($snapshot->filename)->toBe('partial.sql.gz')
+            ->and($snapshot->files()->completed()->first()->volume_id)->toBe($volumeA->id)
+            ->and($snapshot->files()->where('status', SnapshotFileStatus::Failed)->first()->error)->toBe('S3 unreachable');
+    });
+});
+
+describe('job failure', function () {
+    test('can report job failure', function () {
+        ['agent' => $agent, 'token' => $token] = createAgentWithToken();
+        $agentJob = AgentJob::factory()->claimed($agent)->create();
+
+        $logs = [
+            ['timestamp' => now()->toIso8601String(), 'type' => 'log', 'level' => 'info', 'message' => 'Starting backup for database: testdb'],
+            ['timestamp' => now()->toIso8601String(), 'type' => 'log', 'level' => 'error', 'message' => 'Backup failed: Connection refused'],
+        ];
+
+        $this->withToken($token)
+            ->postJson("/api/v1/agent/jobs/{$agentJob->id}/fail", [
+                'error_message' => 'Connection refused to database server',
+                'logs' => $logs,
+            ])
+            ->assertOk();
+
+        $agentJob->refresh();
+        expect($agentJob->status)->toBe(AgentJob::STATUS_FAILED)
+            ->and($agentJob->error_message)->toBe('Connection refused to database server')
+            ->and($agentJob->completed_at)->not->toBeNull();
+
+        // BackupJob should be failed with logs written
+        $backupJob = $agentJob->snapshot->fresh()->job;
+        expect($backupJob->status)->toBe(BackupJobStatus::Failed)
+            ->and($backupJob->logs)->toHaveCount(2)
+            ->and($backupJob->logs[1]['message'])->toBe('Backup failed: Connection refused');
+    });
+
+    test('failing a discovery job records a failed snapshot and notifies, like a failed pre-flight', function () {
+        \App\Models\NotificationChannel::factory()->email()->create();
+
+        ['agent' => $agent, 'token' => $token] = createAgentWithToken();
+        $server = DatabaseServer::factory()->create([
+            'agent_id' => $agent->id,
+            'database_selection_mode' => 'all',
+        ]);
+
+        $agentJob = AgentJob::factory()->discover()->claimed($agent)->create([
+            'database_server_id' => $server->id,
+            'payload' => ['backup_id' => $server->backups()->first()->id, 'method' => 'scheduled'],
+        ]);
+
+        $this->withToken($token)
+            ->postJson("/api/v1/agent/jobs/{$agentJob->id}/fail", [
+                'error_message' => 'Cannot connect to database',
+            ])
+            ->assertOk();
+
+        $agentJob->refresh();
+        expect($agentJob->status)->toBe(AgentJob::STATUS_FAILED)
+            ->and($agentJob->error_message)->toBe('Cannot connect to database');
+
+        $snapshot = Snapshot::where('database_server_id', $server->id)->sole();
+        expect($snapshot->database_name)->toBe('(all databases)')
+            ->and($snapshot->method)->toBe('scheduled')
+            ->and($snapshot->job->status)->toBe(BackupJobStatus::Failed)
+            ->and($snapshot->job->error_message)->toBe('Cannot connect to database');
+        Notification::assertSentTimes(\App\Notifications\BackupFailedNotification::class, 1);
+    });
+});
+
+describe('log accumulation across heartbeat and terminal operations', function () {
+    test('logs accumulate from heartbeat to terminal operation', function (string $endpoint, array $payload) {
+        ['agent' => $agent, 'token' => $token] = createAgentWithToken();
+        $agentJob = AgentJob::factory()->claimed($agent)->create();
+
+        // Simulate progressive logs sent during heartbeats
+        $this->withToken($token)
+            ->postJson("/api/v1/agent/jobs/{$agentJob->id}/heartbeat", [
+                'logs' => [
+                    ['timestamp' => now()->toIso8601String(), 'type' => 'log', 'level' => 'info', 'message' => 'Dump started'],
+                    ['timestamp' => now()->toIso8601String(), 'type' => 'log', 'level' => 'info', 'message' => 'Dump completed'],
+                ],
+            ]);
+
+        // Terminal operation with final logs
+        $this->withToken($token)
+            ->postJson("/api/v1/agent/jobs/{$agentJob->id}/{$endpoint}", array_merge($payload, [
+                'logs' => [
+                    ['timestamp' => now()->toIso8601String(), 'type' => 'log', 'level' => 'info', 'message' => 'Final step'],
+                ],
+            ]))
+            ->assertOk();
+
+        $backupJob = $agentJob->snapshot->job->fresh();
+        expect($backupJob->logs)->toHaveCount(3)
+            ->and($backupJob->logs[0]['message'])->toBe('Dump started')
+            ->and($backupJob->logs[1]['message'])->toBe('Dump completed')
+            ->and($backupJob->logs[2]['message'])->toBe('Final step');
+    })->with([
+        'ack' => ['ack', ['filename' => 'backups/test.sql.gz', 'file_size' => 12345, 'checksum' => 'abc123']],
+        'fail' => ['fail', ['error_message' => 'Connection lost']],
+    ]);
+});
+
+describe('ownership checks', function () {
+    test('cannot act on another agent job', function (string $endpoint, array $payload) {
+        ['token' => $token] = createAgentWithToken();
+        $otherAgent = Agent::factory()->create();
+        $agentJob = AgentJob::factory()->claimed($otherAgent)->create();
+
+        $this->withToken($token)
+            ->postJson("/api/v1/agent/jobs/{$agentJob->id}/{$endpoint}", $payload)
+            ->assertForbidden();
+    })->with([
+        'heartbeat' => ['heartbeat', []],
+        'ack' => ['ack', ['filename' => 'test.sql.gz', 'file_size' => 123]],
+        'fail' => ['fail', ['error_message' => 'Error']],
+    ]);
+
+    test('cannot report discovered databases for another agent job', function () {
+        ['token' => $token] = createAgentWithToken();
+        $otherAgent = Agent::factory()->create();
+        $server = DatabaseServer::factory()->create(['agent_id' => $otherAgent->id]);
+
+        $agentJob = AgentJob::factory()->discover()->claimed($otherAgent)->create([
+            'database_server_id' => $server->id,
+        ]);
+
+        $this->withToken($token)
+            ->postJson("/api/v1/agent/jobs/{$agentJob->id}/discovered-databases", [
+                'databases' => ['db1'],
+            ])
+            ->assertForbidden();
+    });
+});
+
+describe('discovery jobs', function () {
+    test('can claim a discovery job', function () {
+        ['agent' => $agent, 'token' => $token] = createAgentWithToken();
+        $server = DatabaseServer::factory()->create(['agent_id' => $agent->id]);
+
+        $agentJob = AgentJob::factory()->discover()->create([
+            'database_server_id' => $server->id,
+        ]);
+
+        $response = $this->withToken($token)
+            ->postJson('/api/v1/agent/jobs/claim')
+            ->assertOk();
+
+        $jobData = $response->json('job');
+        expect($jobData)->not->toBeNull()
+            ->and($jobData['id'])->toBe($agentJob->id)
+            ->and($jobData['snapshot_id'])->toBeNull()
+            ->and($jobData['type'])->toBe('discover');
+    });
+
+    test('can report discovered databases', function () {
+        ['agent' => $agent, 'token' => $token] = createAgentWithToken();
+
+        $server = DatabaseServer::factory()->create([
+            'agent_id' => $agent->id,
+            'database_selection_mode' => 'all',
+        ]);
+        $server->load('backups.volumes');
+        $backup = $server->backups->first();
+
+        $agentJob = AgentJob::factory()->discover()->claimed($agent)->create([
+            'database_server_id' => $server->id,
+            'payload' => ['backup_id' => $backup->id],
+        ]);
+
+        $response = $this->withToken($token)
+            ->postJson("/api/v1/agent/jobs/{$agentJob->id}/discovered-databases", [
+                'databases' => ['db1', 'db2', 'db3'],
+            ])
+            ->assertOk();
+
+        expect($response->json('jobs_created'))->toBe(3);
+
+        // Discovery job should be completed
+        $agentJob->refresh();
+        expect($agentJob->status)->toBe(AgentJob::STATUS_COMPLETED);
+
+        // 3 backup agent jobs should have been created
+        $backupJobs = AgentJob::where('database_server_id', $server->id)
+            ->where('type', AgentJobType::Backup)
+            ->get();
+
+        expect($backupJobs)->toHaveCount(3);
+
+        $dbNames = Snapshot::whereIn('id', $backupJobs->pluck('snapshot_id'))
+            ->pluck('database_name')
+            ->sort()
+            ->values()
+            ->toArray();
+
+        expect($dbNames)->toBe(['db1', 'db2', 'db3']);
+    });
+
+    test('a discovery that matches no database completes without backups', function () {
+        ['agent' => $agent, 'token' => $token] = createAgentWithToken();
+        $server = DatabaseServer::factory()->create(['agent_id' => $agent->id]);
+
+        $agentJob = AgentJob::factory()->discover()->claimed($agent)->create([
+            'database_server_id' => $server->id,
+            'payload' => ['backup_id' => $server->backups()->first()->id],
+        ]);
+
+        $this->withToken($token)
+            ->postJson("/api/v1/agent/jobs/{$agentJob->id}/discovered-databases", ['databases' => []])
+            ->assertOk()
+            ->assertJsonPath('jobs_created', 0);
+
+        expect($agentJob->fresh()->status)->toBe(AgentJob::STATUS_COMPLETED)
+            ->and(Snapshot::where('database_server_id', $server->id)->exists())->toBeFalse();
+    });
+
+    test('discovered-databases rejects a discovery job whose payload has no backup_id', function () {
+        ['agent' => $agent, 'token' => $token] = createAgentWithToken();
+
+        $server = DatabaseServer::factory()->create(['agent_id' => $agent->id]);
+
+        // Legacy payload (pre-multi-backup) with no backup_id — a stuck job
+        // from before the upgrade. The controller must refuse to fabricate
+        // snapshots with an unknown parent.
+        $agentJob = AgentJob::factory()->discover()->claimed($agent)->create([
+            'database_server_id' => $server->id,
+            'payload' => [],
+        ]);
+
+        $this->withToken($token)
+            ->postJson("/api/v1/agent/jobs/{$agentJob->id}/discovered-databases", [
+                'databases' => ['db1'],
+            ])
+            ->assertStatus(422)
+            ->assertJsonPath('message', 'Backup configuration not found for this discovery job.');
+    });
+
+    test('discovered-databases rejects non-discovery jobs', function () {
+        ['agent' => $agent, 'token' => $token] = createAgentWithToken();
+
+        $agentJob = AgentJob::factory()->claimed($agent)->create();
+
+        $this->withToken($token)
+            ->postJson("/api/v1/agent/jobs/{$agentJob->id}/discovered-databases", [
+                'databases' => ['db1'],
+            ])
+            ->assertStatus(422);
+    });
+
+    test('discovered-databases rejects duplicate database names', function () {
+        ['agent' => $agent, 'token' => $token] = createAgentWithToken();
+
+        $server = DatabaseServer::factory()->create([
+            'agent_id' => $agent->id,
+            'database_selection_mode' => 'all',
+        ]);
+        $server->load('backups');
+        $backup = $server->backups->first();
+
+        $agentJob = AgentJob::factory()->discover()->claimed($agent)->create([
+            'database_server_id' => $server->id,
+            'payload' => ['backup_id' => $backup->id],
+        ]);
+
+        $this->withToken($token)
+            ->postJson("/api/v1/agent/jobs/{$agentJob->id}/discovered-databases", [
+                'databases' => ['db1', 'db2', 'db1'],
+            ])
+            ->assertUnprocessable()
+            ->assertJsonValidationErrors(['databases.2']);
+    });
+});
+
+describe('job state guards', function () {
+    test('terminal jobs cannot be acted on', function (string $endpoint) {
+        ['agent' => $agent, 'token' => $token] = createAgentWithToken();
+        // A completed job is terminal: no further heartbeat/ack/fail/report is allowed.
+        $agentJob = AgentJob::factory()->completed($agent)->create();
+
+        $this->withToken($token)
+            ->postJson("/api/v1/agent/jobs/{$agentJob->id}/{$endpoint}")
+            ->assertStatus(409);
+    })->with([
+        'heartbeat' => ['heartbeat'],
+        'ack' => ['ack'],
+        'fail' => ['fail'],
+        'discovered-databases' => ['discovered-databases'],
+    ]);
+
+    test('acknowledging a discovery job with its databases works like discovered-databases', function () {
+        ['agent' => $agent, 'token' => $token] = createAgentWithToken();
+        $server = DatabaseServer::factory()->create(['agent_id' => $agent->id]);
+        $agentJob = AgentJob::factory()->discover()->claimed($agent)->create([
+            'database_server_id' => $server->id,
+            'payload' => ['backup_id' => $server->backups()->first()->id],
+        ]);
+
+        $this->withToken($token)
+            ->postJson("/api/v1/agent/jobs/{$agentJob->id}/ack", ['databases' => ['db1', 'db2']])
+            ->assertOk()
+            ->assertJsonPath('jobs_created', 2);
+
+        expect($agentJob->fresh()->status)->toBe(AgentJob::STATUS_COMPLETED);
+    });
+});
+
+describe('compatibility with agents up to 1.8', function () {
+    test('a discovery job still carries its type inside the payload', function () {
+        ['agent' => $agent, 'token' => $token] = createAgentWithToken();
+        $server = DatabaseServer::factory()->create(['agent_id' => $agent->id]);
+        AgentJob::factory()->discover()->create(['database_server_id' => $server->id]);
+
+        // Agents up to 1.8 claim without job_types and read payload.type.
+        $this->withToken($token)
+            ->postJson('/api/v1/agent/jobs/claim')
+            ->assertOk()
+            ->assertJsonPath('job.type', 'discover')
+            ->assertJsonPath('job.payload.type', 'discover');
+    });
+});
+
+describe('failed auth throttling', function () {
+    test('blocks requests once the failed-auth limit is reached', function () {
+        // Simulate 10 prior failed-auth hits recorded by the middleware for this IP.
+        foreach (range(1, 10) as $attempt) {
+            RateLimiter::hit('agent-auth:127.0.0.1', 300);
+        }
+
+        $request = Request::create('/api/v1/agent/heartbeat', 'POST');
+        $response = (new ThrottleFailedAgentAuth)->handle($request, fn () => response('ok'));
+
+        expect($response->getStatusCode())->toBe(429);
+    });
+});

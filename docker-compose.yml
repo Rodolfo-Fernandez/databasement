@@ -1,0 +1,282 @@
+# Local development compose. DB ports are bound to 127.0.0.1 only.
+# For production self-hosting: https://david-crty.github.io/databasement/self-hosting/docker-compose
+
+services:
+  app:
+    image: davidcrty/databasement-php
+    build:
+      context: docker/php
+    volumes:
+      - .:/app
+      - app-data:/data
+      # Pest's Test Impact Analysis baseline (~/.pest/tia). Kept in a named
+      # volume so `make test-tia` doesn't have to re-record it after every
+      # container recreate.
+      - pest-cache:/home/application/.pest
+    ports:
+      - "2226:2226"
+    environment:
+      TZ: UTC
+      XDG_CONFIG_HOME: /tmp
+      # PUID/PGID for the application user (defaults to 1000:1000)
+      # Set these to match your host user for proper file permissions
+      PUID: 1000
+      PGID: 1000
+    depends_on:
+      - rustfs
+
+  worker:
+    image: davidcrty/databasement-php
+    build:
+      context: docker/php
+    volumes:
+      - .:/app
+      - app-data:/data
+    environment:
+      TZ: UTC
+      ENABLE_QUEUE_WORKER: "true"
+      ENABLE_WEB_SERVER: "false"
+      ENABLE_SCHEDULER: "false"
+      PUID: 1000
+      PGID: 1000
+    depends_on:
+      - app
+      - rustfs
+
+#  agent:
+#    image: davidcrty/databasement-php
+#    restart: unless-stopped
+#    environment:
+#      DATABASEMENT_URL: 'http://app:2226'
+#      DATABASEMENT_AGENT_TOKEN: ''
+#    volumes:
+#      - .:/app
+#    depends_on:
+#      - app
+
+  mysql:
+    image: mysql:8.4
+    container_name: databasement-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: databasement
+    ports:
+      - "127.0.0.1:3307:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: [ "CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-proot" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Separate from `mysql` because the two are dumped by different clients:
+  # MySQL servers by Oracle's mysqldump, MariaDB by mariadb-dump.
+  mariadb:
+    image: mariadb:11.8
+    container_name: databasement-mariadb
+    environment:
+      MARIADB_ROOT_PASSWORD: root
+      MARIADB_DATABASE: databasement
+    ports:
+      - "127.0.0.1:3308:3306"
+    volumes:
+      - mariadb-data:/var/lib/mysql
+    healthcheck:
+      test: [ "CMD", "healthcheck.sh", "--connect", "--innodb_initialized" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  postgres:
+    image: postgres:17
+    container_name: databasement-postgres
+    environment:
+      POSTGRES_USER: root
+      POSTGRES_PASSWORD: root
+      POSTGRES_DB: databasement
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U root -d databasement" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  mongodb:
+    image: mongo:7
+    container_name: databasement-mongodb
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: root
+      MONGO_INITDB_ROOT_PASSWORD: root
+    ports:
+      - "127.0.0.1:27017:27017"
+    volumes:
+      - mongodb-data:/data/db
+    healthcheck:
+      test: [ "CMD", "mongosh", "--eval", "db.adminCommand('ping')", "--quiet" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7
+    container_name: databasement-redis
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  mssql:
+    # azure-sql-edge is multi-arch (works on Apple Silicon); same TDS protocol as SQL Server
+    image: mcr.microsoft.com/azure-sql-edge:latest
+    container_name: databasement-mssql
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: "Databasement!Strong1"
+    ports:
+      - "127.0.0.1:1433:1433"
+    volumes:
+      - mssql-data:/var/opt/mssql
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 1433 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  firebird:
+    image: firebirdsql/firebird:5
+    container_name: databasement-firebird
+    environment:
+      FIREBIRD_ROOT_PASSWORD: masterkey
+      FIREBIRD_DATABASE: sample.fdb
+    volumes:
+      - firebird-data:/var/lib/firebird/data
+
+  ssh:
+    image: linuxserver/openssh-server:latest
+    container_name: databasement-ssh
+    environment:
+      PUID: 1000
+      PGID: 1000
+      TZ: UTC
+      USER_NAME: testuser
+      USER_PASSWORD: testpass
+      PASSWORD_ACCESS: "true"
+      DOCKER_MODS: linuxserver/mods:openssh-server-ssh-tunnel
+    ports:
+      - "127.0.0.1:2222:2222"
+    healthcheck:
+      test: [ "CMD-SHELL", "netstat -tlnp | grep -q ':2222'" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  rustfs:
+    image: rustfs/rustfs:latest
+    container_name: databasement-rustfs
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    environment:
+      RUSTFS_ACCESS_KEY: rustfsadmin
+      RUSTFS_SECRET_KEY: rustfsadmin
+      RUSTFS_VOLUMES: /data
+      RUSTFS_ADDRESS: ":9000"
+      RUSTFS_CONSOLE_ADDRESS: ":9001"
+    volumes:
+      - rustfs-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+# Samba server for local SMB volume testing (host: samba, share: backups, user: smbuser/smbpass)
+#  samba:
+#    image: ghcr.io/servercontainers/samba:latest
+#    container_name: databasement-samba
+#    environment:
+#      ACCOUNT_smbuser: smbpass
+#      UID_smbuser: "1000"
+#      # force user = root so the share is writable regardless of the volume's ownership
+#      SAMBA_VOLUME_CONFIG_backups: "[backups]; path=/shares/backups; valid users = smbuser; guest ok = no; read only = no; browseable = yes; force user = root"
+#      SAMBA_CONF_LOG_LEVEL: "1"
+#    volumes:
+#      - samba-data:/shares/backups
+
+# SFTP server for local testing
+#  sftp:
+#    image: atmoz/sftp
+#    container_name: databasement-sftp
+#    ports:
+#      - "2222:22"
+#    volumes:
+#      - sftp-data:/home/sftpuser/backups
+#    command: sftpuser:sftp123:1001:1001:backups
+
+# FTP server for local testing
+#  ftp:
+#    image: fauria/vsftpd
+#    container_name: databasement-ftp
+#    ports:
+#      - "20:20"
+#      - "21:21"
+#      - "21100-21110:21100-21110"
+#    environment:
+#      FTP_USER: ftpuser
+#      FTP_PASS: ftp123
+#      PASV_ADDRESS: ftp
+#      PASV_MIN_PORT: 21100
+#      PASV_MAX_PORT: 21110
+#      PASV_ADDR_RESOLVE: "YES"
+#    volumes:
+#      - ftp-data:/home/vsftpd/ftpuser
+
+# Dex OIDC provider for local OAuth testing
+# Prerequisites: 1) Add "127.0.0.1 dex-local" to /etc/hosts
+#                2) Set OAUTH_OIDC_ENABLED=true in .env.local
+# Test users (password: databasement):
+#   admin@databasement.com   (groups: databasement-admins, team-a)
+#   user@databasement.com    (groups: databasement-members, team-b)
+#   viewer@databasement.com  (groups: databasement-viewers)
+#   outsider@databasement.com (no groups)
+  dex:
+    image: ghcr.io/dexidp/dex:v2.45.0
+    container_name: databasement-dex
+    volumes:
+      - ./docker/dex/config.yaml:/etc/dex/config.yaml:ro
+    ports:
+      - "127.0.0.1:5556:5556"
+    networks:
+      default:
+        aliases:
+          - dex-local
+    command: ["dex", "serve", "/etc/dex/config.yaml"]
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:5556/dex/.well-known/openid-configuration"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  app-data:
+  pest-cache:
+  mysql-data:
+  mariadb-data:
+  postgres-data:
+  rustfs-data:
+  sftp-data:
+  mongodb-data:
+  redis-data:
+  mssql-data:
+  firebird-data:
+  ftp-data:
+  samba-data:

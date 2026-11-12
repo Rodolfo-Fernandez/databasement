@@ -1,0 +1,475 @@
+<?php
+
+namespace App\Services;
+
+use App\Exceptions\SshTunnelException;
+use App\Models\DatabaseServer;
+use App\Models\DatabaseServerSshConfig;
+use App\Support\Formatters;
+use Symfony\Component\Process\Process;
+
+class SshTunnelService
+{
+    private const CONNECTION_TIMEOUT_SECONDS = 30;
+
+    private const WAIT_INTERVAL_MS = 100;
+
+    /** Overrides {@see CONNECTION_TIMEOUT_SECONDS} for the tunnel being opened. */
+    private ?int $connectTimeoutSeconds = null;
+
+    private ?Process $tunnelProcess = null;
+
+    private ?int $localPort = null;
+
+    private ?string $keyFile = null;
+
+    private ?string $askPassScript = null;
+
+    /**
+     * Establish an SSH tunnel for the given database server.
+     *
+     * @return array{host: string, port: int} The local endpoint to connect to
+     *
+     * @throws SshTunnelException
+     */
+    public function establish(DatabaseServer $server, ?int $connectTimeoutSeconds = null): array
+    {
+        if (! $server->requiresSshTunnel()) {
+            throw new SshTunnelException('SSH tunnel is not configured for this server');
+        }
+
+        $sshConfig = $server->sshConfig;
+        if ($sshConfig === null) {
+            throw new SshTunnelException('SSH configuration not found for this server');
+        }
+
+        return $this->establishFromConfig(
+            $sshConfig->getDecrypted(),
+            $server->host,
+            $server->port,
+            $connectTimeoutSeconds,
+        );
+    }
+
+    /**
+     * Establish an SSH tunnel from a decrypted SSH config array.
+     *
+     * @param  array<string, mixed>  $sshConfig  Decrypted SSH config (host, port, username, auth_type, compression, password, private_key, key_passphrase)
+     * @param  string  $remoteHost  The remote host to tunnel to
+     * @param  int  $remotePort  The remote port to tunnel to
+     * @return array{host: string, port: int} The local endpoint to connect to
+     *
+     * @throws SshTunnelException
+     */
+    public function establishFromConfig(
+        array $sshConfig,
+        string $remoteHost,
+        int $remotePort,
+        ?int $connectTimeoutSeconds = null,
+    ): array {
+        $this->connectTimeoutSeconds = $connectTimeoutSeconds;
+        $this->localPort = $this->allocateLocalPort();
+        $command = $this->buildSshCommand(
+            sshHost: $sshConfig['host'] ?? '',
+            sshPort: (int) ($sshConfig['port'] ?? 22),
+            sshUsername: $sshConfig['username'] ?? '',
+            authType: $sshConfig['auth_type'] ?? 'password',
+            password: $sshConfig['password'] ?? null,
+            privateKey: $sshConfig['private_key'] ?? null,
+            keyPassphrase: $sshConfig['key_passphrase'] ?? null,
+            remoteHost: $remoteHost,
+            remotePort: $remotePort,
+            localPort: $this->localPort,
+            compression: (bool) ($sshConfig['compression'] ?? false)
+        );
+
+        $this->tunnelProcess = $this->createTunnelProcess($command);
+        $this->tunnelProcess->setTimeout(null);
+
+        try {
+            $this->tunnelProcess->start();
+        } catch (\Throwable $e) {
+            $this->close();
+            throw new SshTunnelException('Failed to start SSH tunnel process: '.$e->getMessage(), previous: $e);
+        }
+
+        // Wait for tunnel to be established
+        if (! $this->waitForTunnel()) {
+            $errorOutput = $this->tunnelProcess->getErrorOutput();
+            $this->close();
+            throw new SshTunnelException(
+                'Failed to establish SSH tunnel: '.$this->sanitizeError($errorOutput),
+                sshErrorOutput: $errorOutput
+            );
+        }
+
+        return [
+            'host' => '127.0.0.1',
+            'port' => $this->localPort,
+        ];
+    }
+
+    private function connectTimeout(): int
+    {
+        return $this->connectTimeoutSeconds ?? self::CONNECTION_TIMEOUT_SECONDS;
+    }
+
+    /**
+     * Close the SSH tunnel and clean up resources.
+     */
+    public function close(): void
+    {
+        if ($this->tunnelProcess !== null && $this->tunnelProcess->isRunning()) {
+            $this->tunnelProcess->stop(3);
+        }
+
+        $this->tunnelProcess = null;
+        $this->localPort = null;
+        $this->connectTimeoutSeconds = null;
+        $this->cleanupTempFiles();
+    }
+
+    /**
+     * Test an SSH connection without establishing a tunnel.
+     *
+     * @return array{success: bool, message: string, details: array<string, mixed>}
+     */
+    public function testConnection(DatabaseServerSshConfig $sshConfig): array
+    {
+        try {
+            $decrypted = $sshConfig->getDecrypted();
+            $command = $this->buildTestCommand($decrypted);
+
+            $process = Process::fromShellCommandLine($command);
+            $process->setTimeout(self::CONNECTION_TIMEOUT_SECONDS);
+
+            $startTime = microtime(true);
+            $process->run();
+            $durationMs = Formatters::elapsedMs($startTime);
+
+            if (! $process->isSuccessful()) {
+                $errorOutput = trim($process->getErrorOutput() ?: $process->getOutput());
+
+                return [
+                    'success' => false,
+                    'message' => $this->sanitizeError($errorOutput) ?: 'SSH connection failed',
+                    'details' => [],
+                ];
+            }
+
+            return [
+                'success' => true,
+                'message' => 'SSH connection successful',
+                'details' => [
+                    'ping_ms' => $durationMs,
+                ],
+            ];
+        } finally {
+            $this->cleanupTempFiles();
+        }
+    }
+
+    /**
+     * Check if the tunnel is currently active.
+     */
+    public function isActive(): bool
+    {
+        return $this->tunnelProcess !== null && $this->tunnelProcess->isRunning();
+    }
+
+    /**
+     * Get the local port being used for the tunnel.
+     */
+    public function getLocalPort(): ?int
+    {
+        return $this->localPort;
+    }
+
+    /**
+     * Allocate an available local port by binding to port 0.
+     *
+     * @throws SshTunnelException
+     */
+    protected function allocateLocalPort(): int
+    {
+        $socket = @socket_create(AF_INET, SOCK_STREAM, SOL_TCP);
+        if ($socket === false) {
+            throw new SshTunnelException('Failed to create socket for port allocation');
+        }
+
+        if (! @socket_bind($socket, '127.0.0.1', 0)) {
+            socket_close($socket);
+            throw new SshTunnelException('Failed to bind socket for port allocation');
+        }
+
+        if (! @socket_getsockname($socket, $addr, $port)) {
+            socket_close($socket);
+            throw new SshTunnelException('Failed to get allocated port');
+        }
+
+        socket_close($socket);
+
+        return $port;
+    }
+
+    /**
+     * Create a Process instance for the tunnel command.
+     * Protected to allow mocking in tests.
+     */
+    protected function createTunnelProcess(string $command): Process
+    {
+        return Process::fromShellCommandLine($command);
+    }
+
+    /**
+     * Build the SSH tunnel command.
+     */
+    private function buildSshCommand(
+        string $sshHost,
+        int $sshPort,
+        string $sshUsername,
+        string $authType,
+        ?string $password,
+        ?string $privateKey,
+        ?string $keyPassphrase,
+        string $remoteHost,
+        int $remotePort,
+        int $localPort,
+        bool $compression = false
+    ): string {
+        // BatchMode=yes only for passphrase-less key auth; password and key+passphrase need interactive mode
+        $batchMode = $authType === 'key' && empty($keyPassphrase);
+
+        $sshOptions = $this->buildBaseOptions($sshPort, $batchMode, [
+            '-N', // Don't execute remote command
+            '-o', 'ServerAliveInterval=30',
+            '-o', 'ServerAliveCountMax=3',
+            '-o', 'ExitOnForwardFailure=yes',
+            '-L', sprintf('%d:%s:%d', $localPort, $remoteHost, $remotePort),
+        ], $compression);
+
+        return $this->buildAuthenticatedCommand(
+            $sshOptions,
+            $sshHost,
+            $sshUsername,
+            $authType,
+            $password,
+            $privateKey,
+            $keyPassphrase
+        );
+    }
+
+    /**
+     * Build command to test SSH connection.
+     *
+     * @param  array<string, mixed>  $sshConfig
+     */
+    private function buildTestCommand(array $sshConfig): string
+    {
+        $sshHost = $sshConfig['host'] ?? '';
+        $sshPort = (int) ($sshConfig['port'] ?? 22);
+        $sshUsername = $sshConfig['username'] ?? '';
+        $authType = $sshConfig['auth_type'] ?? 'password';
+        $password = $sshConfig['password'] ?? null;
+        $privateKey = $sshConfig['private_key'] ?? null;
+        $keyPassphrase = $sshConfig['key_passphrase'] ?? null;
+
+        // BatchMode=yes only for passphrase-less key auth; password and key+passphrase need interactive mode
+        $batchMode = $authType === 'key' && empty($keyPassphrase);
+        $compression = (bool) ($sshConfig['compression'] ?? false);
+
+        $sshOptions = $this->buildBaseOptions($sshPort, $batchMode, compression: $compression);
+
+        return $this->buildAuthenticatedCommand(
+            $sshOptions,
+            $sshHost,
+            $sshUsername,
+            $authType,
+            $password,
+            $privateKey,
+            $keyPassphrase,
+            'exit 0'
+        );
+    }
+
+    /**
+     * Build base SSH options common to all commands.
+     *
+     * @param  bool  $batchMode  Use BatchMode=yes for non-interactive auth (passphrase-less keys), BatchMode=no for password/passphrase auth
+     * @param  array<string>  $additionalOptions
+     * @param  bool  $compression  Enable SSH compression (-C), trading CPU for bandwidth on slow links
+     * @return array<string>
+     */
+    private function buildBaseOptions(int $sshPort, bool $batchMode = true, array $additionalOptions = [], bool $compression = false): array
+    {
+        return array_merge([
+            '-o', 'StrictHostKeyChecking=accept-new',
+            '-o', $batchMode ? 'BatchMode=yes' : 'BatchMode=no',
+            '-o', sprintf('ConnectTimeout=%d', $this->connectTimeout()),
+            '-p', (string) $sshPort,
+        ], $compression ? ['-C'] : [], $additionalOptions);
+    }
+
+    /**
+     * Build the final SSH command with authentication.
+     *
+     * @param  array<string>  $sshOptions
+     */
+    private function buildAuthenticatedCommand(
+        array $sshOptions,
+        string $sshHost,
+        string $sshUsername,
+        string $authType,
+        ?string $password,
+        ?string $privateKey,
+        ?string $keyPassphrase,
+        string $remoteCommand = ''
+    ): string {
+        $optionsString = implode(' ', array_map('escapeshellarg', $sshOptions));
+
+        // `-l user host` rather than `user@host`: concatenating them puts the
+        // username in the first character position of the argument, where a
+        // leading dash is parsed by ssh as an option rather than a destination.
+        $destination = '-l '.escapeshellarg($sshUsername).' -- '.escapeshellarg($sshHost);
+        $suffix = $remoteCommand !== '' ? ' '.$remoteCommand : '';
+
+        if ($authType === 'key' && ! empty($privateKey)) {
+            $this->keyFile = $this->writeKeyToTempFile($privateKey);
+            $optionsString .= ' -i '.escapeshellarg($this->keyFile);
+
+            if (! empty($keyPassphrase)) {
+                try {
+                    $this->askPassScript = $this->createAskPassScript($keyPassphrase);
+                } catch (SshTunnelException $e) {
+                    // Clean up the key file if askpass creation fails
+                    @unlink($this->keyFile);
+                    $this->keyFile = null;
+                    throw $e;
+                }
+
+                return sprintf(
+                    'SSH_ASKPASS=%s SSH_ASKPASS_REQUIRE=force setsid ssh %s %s%s',
+                    escapeshellarg($this->askPassScript),
+                    $optionsString,
+                    $destination,
+                    $suffix
+                );
+            }
+        } elseif ($authType === 'password' && ! empty($password)) {
+            // Use SSHPASS env var with -e flag to avoid exposing password in process args
+            return sprintf(
+                'SSHPASS=%s sshpass -e ssh %s %s%s',
+                escapeshellarg($password),
+                $optionsString,
+                $destination,
+                $suffix
+            );
+        }
+
+        return sprintf('ssh %s %s%s', $optionsString, $destination, $suffix);
+    }
+
+    /**
+     * Write private key to a temporary file with proper permissions.
+     *
+     * @throws SshTunnelException
+     */
+    private function writeKeyToTempFile(string $key): string
+    {
+        $tempFile = tempnam(sys_get_temp_dir(), 'ssh_key_');
+        if ($tempFile === false) {
+            throw new SshTunnelException('Failed to create temporary file for SSH key');
+        }
+
+        if (file_put_contents($tempFile, $key) === false) {
+            @unlink($tempFile);
+            throw new SshTunnelException('Failed to write SSH key to temporary file');
+        }
+
+        if (chmod($tempFile, 0600) === false) {
+            @unlink($tempFile);
+            throw new SshTunnelException('Failed to set permissions on SSH key temporary file');
+        }
+
+        return $tempFile;
+    }
+
+    /**
+     * Create a temporary script for SSH_ASKPASS.
+     *
+     * @throws SshTunnelException
+     */
+    private function createAskPassScript(string $passphrase): string
+    {
+        $script = tempnam(sys_get_temp_dir(), 'askpass_');
+        if ($script === false) {
+            throw new SshTunnelException('Failed to create askpass script');
+        }
+
+        $content = "#!/bin/bash\necho ".escapeshellarg($passphrase);
+        if (file_put_contents($script, $content) === false) {
+            @unlink($script);
+            throw new SshTunnelException('Failed to write askpass script');
+        }
+
+        if (chmod($script, 0700) === false) {
+            @unlink($script);
+            throw new SshTunnelException('Failed to set permissions on askpass script');
+        }
+
+        return $script;
+    }
+
+    /**
+     * Wait for the tunnel to be established by checking if the local port is accepting connections.
+     * Protected to allow mocking in tests.
+     */
+    protected function waitForTunnel(): bool
+    {
+        $attempts = (int) ceil($this->connectTimeout() * 1000 / self::WAIT_INTERVAL_MS);
+
+        for ($i = 0; $i < $attempts; $i++) {
+            // Check if the process has terminated with an error
+            if (! $this->tunnelProcess->isRunning()) {
+                return false;
+            }
+
+            // Try to connect to the local port
+            $socket = @fsockopen('127.0.0.1', $this->localPort, $errno, $errstr, 1);
+            if ($socket !== false) {
+                fclose($socket);
+
+                return true;
+            }
+
+            usleep(self::WAIT_INTERVAL_MS * 1000);
+        }
+
+        return false;
+    }
+
+    /**
+     * Sanitize SSH error output for display.
+     */
+    private function sanitizeError(string $error): string
+    {
+        $lines = explode("\n", trim($error));
+        $filtered = array_filter($lines, fn (string $line) => $line !== '' && ! str_starts_with($line, 'Warning:'));
+
+        return implode(' ', array_map('trim', $filtered));
+    }
+
+    /**
+     * Clean up temporary files (key file and askpass script).
+     */
+    private function cleanupTempFiles(): void
+    {
+        foreach ([$this->keyFile, $this->askPassScript] as $file) {
+            if ($file !== null && file_exists($file)) {
+                unlink($file);
+            }
+        }
+        $this->keyFile = null;
+        $this->askPassScript = null;
+    }
+}

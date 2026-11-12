@@ -1,0 +1,137 @@
+<?php
+
+namespace App\Livewire\DatabaseServer;
+
+use App\Actions\DatabaseServer\DeleteDatabaseServerAction;
+use App\Enums\NotificationChannelSelection;
+use App\Enums\NotificationTrigger;
+use App\Exceptions\DatabaseServer\DatabaseServerFilesNotDeletedException;
+use App\Livewire\DatabaseServer\Concerns\OpensServerRestore;
+use App\Models\DatabaseServer;
+use App\Models\NotificationChannel;
+use App\Models\Restore;
+use App\Traits\OpensAdminerForServer;
+use App\Traits\RunsServerBackups;
+use App\Traits\Toast;
+use Illuminate\Contracts\View\View;
+use Illuminate\Database\Eloquent\Collection;
+use Illuminate\Foundation\Auth\Access\AuthorizesRequests;
+use Illuminate\Support\Facades\Gate;
+use Livewire\Attributes\Title;
+use Livewire\Component;
+
+#[Title('Database Server')]
+class Show extends Component
+{
+    use AuthorizesRequests, OpensAdminerForServer, OpensServerRestore, RunsServerBackups, Toast;
+
+    public DatabaseServer $server;
+
+    public int $snapshotsCount = 0;
+
+    public int $snapshotsSize = 0;
+
+    public int $restoresCount = 0;
+
+    public bool $showDeleteModal = false;
+
+    public int $deleteSnapshotCount = 0;
+
+    public bool $keepFiles = false;
+
+    public function mount(DatabaseServer $server): void
+    {
+        $this->authorize('view', $server);
+
+        $server->load([
+            'sshConfig',
+            'agent',
+            'backups.volumes',
+            'backups.backupSchedule',
+            'notificationChannels',
+        ]);
+
+        $this->server = $server;
+        $snapshotStats = $server->snapshots()->completed()
+            ->toBase()
+            ->selectRaw('count(*) as total, coalesce(sum(file_size), 0) as size')
+            ->first();
+        $this->snapshotsCount = (int) $snapshotStats?->total;
+        $this->snapshotsSize = (int) $snapshotStats?->size;
+        $this->restoresCount = Restore::where('target_server_id', $server->id)->count();
+    }
+
+    public function runBackupAll(): void
+    {
+        $this->authorize('backup', $this->server);
+
+        $this->server->load(['backups.volumes', 'backups.backupSchedule']);
+
+        $this->triggerAllBackups($this->server);
+    }
+
+    public function confirmRestore(): void
+    {
+        $this->openRestoreFor($this->server);
+    }
+
+    public function openAdminer(): void
+    {
+        $this->openAdminerForServer($this->server);
+    }
+
+    public function confirmDelete(): void
+    {
+        $this->authorize('delete', $this->server);
+
+        $this->deleteSnapshotCount = $this->server->snapshots()->count();
+        $this->keepFiles = false;
+        $this->showDeleteModal = true;
+    }
+
+    public function delete(): void
+    {
+        $this->authorize('delete', $this->server);
+
+        try {
+            DeleteDatabaseServerAction::run($this->server, $this->keepFiles);
+        } catch (DatabaseServerFilesNotDeletedException) {
+            $this->showDeleteModal = false;
+            $this->error(__('The database server was kept because some backup files could not be deleted. Try again, or delete it while keeping the files.'));
+
+            return;
+        }
+
+        $this->showDeleteModal = false;
+
+        $this->success(
+            title: __('Database server deleted successfully!'),
+            redirectTo: route('database-servers.index'),
+        );
+    }
+
+    /**
+     * Notification channels actually delivered to for this server. Empty when
+     * the trigger is disabled.
+     *
+     * @return Collection<int, NotificationChannel>
+     */
+    public function activeChannels(): Collection
+    {
+        if ($this->server->notification_trigger === NotificationTrigger::None) {
+            return new Collection;
+        }
+
+        return $this->server->notification_channel_selection === NotificationChannelSelection::All
+            ? NotificationChannel::orderBy('name')->get()
+            : $this->server->notificationChannels;
+    }
+
+    public function render(): View
+    {
+        return view('livewire.database-server.show', [
+            'activeChannels' => $this->activeChannels(),
+            'canAdminer' => Gate::allows('adminer', DatabaseServer::class),
+        ]);
+    }
+}

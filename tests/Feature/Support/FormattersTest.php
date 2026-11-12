@@ -1,0 +1,180 @@
+<?php
+
+use App\Support\Formatters;
+
+test('humanDuration returns null for null input', function () {
+    expect(Formatters::humanDuration(null))->toBeNull();
+});
+
+test('humanDuration formats milliseconds under 1 second', function () {
+    expect(Formatters::humanDuration(0))->toBe('0ms')
+        ->and(Formatters::humanDuration(1))->toBe('1ms')
+        ->and(Formatters::humanDuration(500))->toBe('500ms')
+        ->and(Formatters::humanDuration(999))->toBe('999ms');
+});
+
+test('humanDuration formats seconds under 1 minute', function () {
+    expect(Formatters::humanDuration(1000))->toBe('1s')
+        ->and(Formatters::humanDuration(1500))->toBe('1.5s')
+        ->and(Formatters::humanDuration(30000))->toBe('30s')
+        ->and(Formatters::humanDuration(59000))->toBe('59s');
+});
+
+test('humanDuration formats minutes and seconds', function () {
+    expect(Formatters::humanDuration(60000))->toBe('1m 0s')
+        ->and(Formatters::humanDuration(90000))->toBe('1m 30s')
+        ->and(Formatters::humanDuration(125000))->toBe('2m 5s')
+        ->and(Formatters::humanDuration(3661000))->toBe('61m 1s');
+});
+
+test('humanFileSize returns 0 B for null or zero input', function () {
+    expect(Formatters::humanFileSize(null))->toBe('0 B')
+        ->and(Formatters::humanFileSize(0))->toBe('0 B');
+});
+
+test('humanFileSize formats bytes', function () {
+    expect(Formatters::humanFileSize(1))->toBe('1 B')
+        ->and(Formatters::humanFileSize(512))->toBe('512 B')
+        ->and(Formatters::humanFileSize(1024))->toBe('1024 B')
+        ->and(Formatters::humanFileSize(1025))->toBe('1 KB');
+});
+
+test('humanFileSize formats kilobytes', function () {
+    expect(Formatters::humanFileSize(1536))->toBe('1.5 KB')
+        ->and(Formatters::humanFileSize(1048577))->toBe('1 MB');
+});
+
+test('humanFileSize formats megabytes and above', function () {
+    expect(Formatters::humanFileSize(1572864))->toBe('1.5 MB')
+        ->and(Formatters::humanFileSize(1073741825))->toBe('1 GB')
+        ->and(Formatters::humanFileSize(1099511627777))->toBe('1 TB');
+});
+
+test('bytesToGb converts bytes to a trimmed GB string', function (?int $bytes, ?string $expected) {
+    expect(Formatters::bytesToGb($bytes))->toBe($expected);
+})->with([
+    'null passes through' => [null, null],
+    'whole GB' => [10 * (1024 ** 3), '10'],
+    'fractional GB' => [(int) (2.5 * (1024 ** 3)), '2.5'],
+    'sub-GB' => [(int) (0.5 * (1024 ** 3)), '0.5'],
+]);
+
+test('gbToBytes converts a GB value to whole bytes', function (int|float|string|null $gb, ?int $expected) {
+    expect(Formatters::gbToBytes($gb))->toBe($expected);
+})->with([
+    'null is no limit' => [null, null],
+    'blank is no limit' => ['', null],
+    'whole GB string' => ['10', 10 * (1024 ** 3)],
+    'fractional GB float' => [2.5, (int) (2.5 * (1024 ** 3))],
+]);
+
+test('gbToBytes and bytesToGb round-trip a fractional value', function () {
+    expect(Formatters::bytesToGb(Formatters::gbToBytes('7.25')))->toBe('7.25');
+});
+
+test('humanDate returns null for null input', function () {
+    expect(Formatters::humanDate(null))->toBeNull();
+});
+
+test('humanDate formats Carbon instances', function () {
+    $date = \Carbon\Carbon::create(2025, 12, 19, 16, 44, 0);
+    expect(Formatters::humanDate($date))->toBe('Dec 19, 2025, 16:44');
+});
+
+test('humanDate formats DateTime instances', function () {
+    $date = new \DateTime('2025-12-19 16:44:00');
+    expect(Formatters::humanDate($date))->toBe('Dec 19, 2025, 16:44');
+});
+
+test('humanDate formats string dates', function () {
+    expect(Formatters::humanDate('2025-12-19 16:44:00'))->toBe('Dec 19, 2025, 16:44')
+        ->and(Formatters::humanDate('2025-01-05 09:05:00'))->toBe('Jan 5, 2025, 09:05');
+});
+
+test('humanDate handles single digit days correctly', function () {
+    $date = \Carbon\Carbon::create(2025, 1, 5, 9, 5, 0);
+    expect(Formatters::humanDate($date))->toBe('Jan 5, 2025, 09:05');
+});
+
+test('humanDate renders in the configured display timezone', function () {
+    config(['app.display_timezone' => 'Asia/Tokyo']);
+
+    // 2025-12-19 16:44 UTC = 2025-12-20 01:44 Tokyo (UTC+9)
+    $date = \Carbon\Carbon::create(2025, 12, 19, 16, 44, 0, 'UTC');
+
+    expect(Formatters::humanDate($date))->toBe('Dec 20, 2025, 01:44');
+});
+
+test('truncatedList returns an empty string for no names', function () {
+    expect(Formatters::truncatedList([]))->toBe('');
+});
+
+test('truncatedList joins names without a suffix when at or under the limit', function () {
+    expect(Formatters::truncatedList(['alpha', 'beta', 'gamma']))
+        ->toBe('alpha, beta, gamma')
+        ->and(Formatters::truncatedList(['a', 'b', 'c', 'd', 'e']))
+        ->toBe('a, b, c, d, e');
+});
+
+test('truncatedList appends a "+N more" suffix when over the limit', function () {
+    expect(Formatters::truncatedList(['a', 'b', 'c', 'd', 'e', 'f']))
+        ->toBe('a, b, c, d, e +1 more')
+        ->and(Formatters::truncatedList(['a', 'b', 'c'], 1))
+        ->toBe('a +2 more');
+});
+
+test('truncatedList accepts a Collection', function () {
+    expect(Formatters::truncatedList(collect(['a', 'b', 'c']), 2))
+        ->toBe('a, b +1 more');
+});
+
+test('resolveDatePlaceholders replaces year, month and day tokens zero-padded', function () {
+    $date = \Carbon\Carbon::create(2026, 3, 5);
+
+    expect(Formatters::resolveDatePlaceholders('backups/{year}/{month}/{day}', $date))
+        ->toBe('backups/2026/03/05');
+});
+
+test('resolveDatePlaceholders leaves paths without placeholders untouched', function () {
+    $date = \Carbon\Carbon::create(2026, 3, 5);
+
+    expect(Formatters::resolveDatePlaceholders('backups/static', $date))
+        ->toBe('backups/static');
+});
+
+test('resolveDatePlaceholders replaces each placeholder globally', function () {
+    $date = \Carbon\Carbon::create(2026, 12, 31);
+
+    expect(Formatters::resolveDatePlaceholders('{year}/{year}-{month}-{day}/{day}', $date))
+        ->toBe('2026/2026-12-31/31');
+});
+
+test('resolveDatePlaceholders defaults to the current date when none is provided', function () {
+    \Carbon\Carbon::setTestNow(\Carbon\Carbon::create(2026, 7, 8));
+
+    expect(Formatters::resolveDatePlaceholders('archive/{year}/{month}/{day}'))
+        ->toBe('archive/2026/07/08');
+
+    \Carbon\Carbon::setTestNow();
+});
+
+test('resolveDatePlaceholders uses display timezone for "now"', function () {
+    config(['app.display_timezone' => 'Asia/Tokyo']);
+    // 2026-07-07 23:00 UTC = 2026-07-08 08:00 Tokyo — day boundary differs.
+    \Carbon\Carbon::setTestNow(\Carbon\Carbon::create(2026, 7, 7, 23, 0, 0, 'UTC'));
+
+    expect(Formatters::resolveDatePlaceholders('archive/{year}/{month}/{day}'))
+        ->toBe('archive/2026/07/08');
+
+    \Carbon\Carbon::setTestNow();
+});
+
+test('sortColumn falls back when the requested column is not whitelisted', function (?string $requested, string $expected) {
+    // Sort columns arrive from the URL, so an unknown one must not reach the
+    // query builder.
+    expect(Formatters::sortColumn($requested, ['name', 'created_at']))->toBe($expected);
+})->with([
+    'allowed' => ['name', 'name'],
+    'not allowed' => ['id; drop table users', 'created_at'],
+    'null' => [null, 'created_at'],
+]);

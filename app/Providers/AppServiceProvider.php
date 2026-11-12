@@ -1,0 +1,352 @@
+<?php
+
+namespace App\Providers;
+
+use App\Enums\Ability;
+use App\Models\ScheduledRestore;
+use App\Models\User;
+use App\Policies\RestorePolicy;
+use App\Policies\RolePolicy;
+use App\Services\AppConfigService;
+use App\Services\Backup\Compressors\CompressorFactory;
+use App\Services\Backup\Compressors\CompressorInterface;
+use App\Services\Backup\Filesystems\Awss3Filesystem;
+use App\Services\Backup\Filesystems\AzureFilesystem;
+use App\Services\Backup\Filesystems\FilesystemProvider;
+use App\Services\Backup\Filesystems\FtpFilesystem;
+use App\Services\Backup\Filesystems\LocalFilesystem;
+use App\Services\Backup\Filesystems\SftpFilesystem;
+use App\Services\Backup\Filesystems\SmbFilesystem;
+use App\Services\Backup\ShellProcessor;
+use App\Services\CurrentOrganization;
+use App\Support\QueueTimeouts;
+use App\Support\TlsVerification;
+use Dedoc\Scramble\Scramble;
+use Dedoc\Scramble\Support\Generator\OpenApi;
+use Dedoc\Scramble\Support\Generator\Parameter;
+use Dedoc\Scramble\Support\Generator\Schema;
+use Dedoc\Scramble\Support\Generator\SecurityScheme;
+use Dedoc\Scramble\Support\Generator\Types\StringType;
+use GuzzleHttp\Client as GuzzleClient;
+use GuzzleHttp\Exception\BadResponseException;
+use Illuminate\Cache\RateLimiting\Limit;
+use Illuminate\Console\Events\CommandStarting;
+use Illuminate\Http\Request;
+use Illuminate\Notifications\Channels\SlackWebhookChannel;
+use Illuminate\Routing\Route;
+use Illuminate\Support\Facades\Blade;
+use Illuminate\Support\Facades\Event;
+use Illuminate\Support\Facades\Gate;
+use Illuminate\Support\Facades\RateLimiter;
+use Illuminate\Support\ServiceProvider;
+use Illuminate\Support\Str;
+use Laravel\Sanctum\PersonalAccessToken;
+use Psr\Http\Message\RequestInterface;
+use Psr\Http\Message\ResponseInterface;
+use Silber\Bouncer\BouncerFacade as Bouncer;
+use SocialiteProviders\Manager\SocialiteWasCalled;
+
+class AppServiceProvider extends ServiceProvider
+{
+    /**
+     * Register any application services.
+     */
+    public function register(): void
+    {
+        $this->registerOAuthServicesConfig();
+
+        $this->app->singleton(CurrentOrganization::class);
+        $this->app->singleton(AppConfigService::class);
+        $this->app->singleton(ShellProcessor::class);
+        $this->app->when(SlackWebhookChannel::class)
+            ->needs(GuzzleClient::class)
+            ->give(fn () => new GuzzleClient(['allow_redirects' => [
+                'max' => 1,
+                'on_redirect' => fn (RequestInterface $request, ResponseInterface $response) => throw new BadResponseException('Refused to follow a redirect from the Slack webhook.', $request, $response),
+            ]]));
+        $this->app->singleton(CompressorFactory::class);
+        $this->app->singleton(CompressorInterface::class, function ($app) {
+            return $app->make(CompressorFactory::class)->make();
+        });
+        // Register FilesystemProvider with configuration
+        $this->app->singleton(FilesystemProvider::class, function ($app) {
+            $provider = new FilesystemProvider([]);
+
+            // Register filesystem implementations
+            $provider->add(new LocalFilesystem);
+            $provider->add(new Awss3Filesystem);
+            $provider->add(new SftpFilesystem);
+            $provider->add(new FtpFilesystem);
+            $provider->add(new AzureFilesystem);
+            $provider->add(new SmbFilesystem);
+
+            return $provider;
+        });
+    }
+
+    /**
+     * Register OAuth provider configurations for Laravel Socialite.
+     *
+     * This maps config/oauth.php providers to config/services.php format
+     * that Socialite expects, eliminating duplication.
+     */
+    private function registerOAuthServicesConfig(): void
+    {
+        $providers = config('oauth.providers', []);
+
+        foreach ($providers as $name => $provider) {
+            $serviceConfig = [
+                'client_id' => $provider['client_id'] ?? null,
+                'client_secret' => $provider['client_secret'] ?? null,
+                'redirect' => "/oauth/{$name}/callback",
+                'guzzle' => ['verify' => TlsVerification::option()],
+            ];
+
+            // Add provider-specific config
+            if ($name === 'gitlab' && isset($provider['host'])) {
+                $serviceConfig['host'] = $provider['host'];
+            }
+
+            if ($name === 'oidc' && isset($provider['base_url'])) {
+                $serviceConfig['base_url'] = $provider['base_url'];
+            }
+
+            config(["services.{$name}" => $serviceConfig]);
+        }
+    }
+
+    /**
+     * Bootstrap any application services.
+     */
+    public function boot(): void
+    {
+        $this->configureQueueTimeouts();
+        $this->registerOidcSocialiteProvider();
+        $this->validateOAuthConfiguration();
+        $this->registerBouncer();
+        $this->configureApiRateLimiting();
+
+        // Mary UI 2.9's <x-tab> references <x-mary-badge> internally, but its
+        // service provider only registers the `mary-` internal alias for a fixed
+        // subset of components (button/icon/modal/…) and omits badge. Because
+        // Blade resolves component tags at compile time, that unregistered alias
+        // breaks compilation of every <x-tab> when no component prefix is set (as
+        // here). Register the missing alias ourselves. Remove once Mary ships it.
+        Blade::component('mary-badge', \Mary\View\Components\Badge::class);
+
+        Gate::policy(ScheduledRestore::class, RestorePolicy::class);
+        Gate::policy(\Silber\Bouncer\Database\Role::class, RolePolicy::class);
+
+        Scramble::configure()
+            ->routes(fn (Route $route) => Str::startsWith($route->uri, 'api/') && ! Str::startsWith($route->uri, 'api/v1/agent'))
+            ->withDocumentTransformers(function (OpenApi $openApi) {
+                $openApi->secure(
+                    SecurityScheme::http('bearer')
+                );
+
+                $orgParam = Parameter::make('org_id', 'query')
+                    ->description('Organization ID. If omitted, the main organization is used.')
+                    ->setSchema(Schema::fromType(new StringType));
+
+                foreach ($openApi->paths as $path) {
+                    foreach ($path->operations as $operation) {
+                        $operation->addParameters([$orgParam]);
+                    }
+                }
+            });
+    }
+
+    /**
+     * Wire Bouncer into the application.
+     *
+     * Role and ability definitions are global (runtime-editable under
+     * Configuration → Roles); only role assignments are scoped per organization,
+     * so a user can be an Admin in one org and a Viewer in another. The
+     * per-request scope is set by the ScopeBouncer middleware; the global
+     * built-in roles (and their abilities) are seeded by migration.
+     */
+    private function registerBouncer(): void
+    {
+        // Agent mode runs a single CLI command with no database and never
+        // authorizes UI requests.
+        if (config('agent.enabled')) {
+            return;
+        }
+
+        Bouncer::cache();
+
+        // Super admins bypass the catalogue abilities. A blanket Gate::before
+        // returning true for everything can't be used: UserPolicy has guards
+        // that must also constrain super admins (no self-delete, last super
+        // admin). So this only short-circuits the catalogue abilities; the
+        // policy abilities (create/update/delete/...) keep their own super-admin
+        // handling. A Gate::before that returns null defers to Bouncer's grant
+        // resolution — unlike a Gate::define, which would shadow it.
+        //
+        // This also enforces Sanctum token scoping for the catalogue: a real,
+        // scoped-out PersonalAccessToken is denied outright before Bouncer's
+        // role/direct-ability resolution ever runs, without touching the 12
+        // individual policy files. It runs before the super-admin bypass, so a
+        // scoped token limits a super admin too. Session auth and legacy `['*']`
+        // tokens are unaffected (User::tokenCovers()).
+        Gate::before(function (?User $user, string $ability): ?bool {
+            if ($user === null || ! in_array($ability, Ability::names(), true)) {
+                return null;
+            }
+
+            if (! $user->tokenCovers($ability)) {
+                return false;
+            }
+
+            if ($user->isSuperAdmin()) {
+                return true;
+            }
+
+            return null;
+        });
+    }
+
+    /**
+     * Configure the rate limit for the v1 API.
+     *
+     * Keyed per access token so each credential has its own budget instead of
+     * sharing one bucket across every token a user holds. `auth:sanctum` runs
+     * before the throttle, so in practice every request that reaches the
+     * limiter is authenticated; the user and IP fallbacks below only exist so
+     * an unkeyed request can never bypass the limit entirely.
+     */
+    private function configureApiRateLimiting(): void
+    {
+        RateLimiter::for('api', function (Request $request) {
+            $perMinute = (int) config('api.rate_limit');
+
+            if ($perMinute <= 0) {
+                return Limit::none();
+            }
+
+            return Limit::perMinute($perMinute)->by($this->apiRateLimitKey($request));
+        });
+    }
+
+    private function apiRateLimitKey(Request $request): string
+    {
+        $user = $request->user();
+        $token = $user?->currentAccessToken();
+
+        if ($token instanceof PersonalAccessToken) {
+            return 'token:'.$token->getKey();
+        }
+
+        // Session-authenticated requests carry a TransientToken with no id, so
+        // key them by user. Never by IP: behind a proxy that TRUSTED_PROXIES
+        // does not cover, $request->ip() is the proxy's address and every
+        // client behind it would share one bucket.
+        if ($user !== null) {
+            return 'user:'.$user->getAuthIdentifier();
+        }
+
+        return 'ip:'.$request->ip();
+    }
+
+    /**
+     * Keep the queue's retry_after above the longest a backup/restore may run.
+     *
+     * Only workers act on retry_after, so it is read when `queue:work` starts
+     * (before the worker opens its queue connection) rather than on every boot,
+     * which would put a database read in front of every request and command.
+     * Agent mode runs on the sync driver and has no database at all.
+     */
+    private function configureQueueTimeouts(): void
+    {
+        if (config('agent.enabled')) {
+            return;
+        }
+
+        Event::listen(function (CommandStarting $event): void {
+            if ($event->command === 'queue:work') {
+                QueueTimeouts::apply();
+            }
+        });
+    }
+
+    /**
+     * Register the generic OIDC Socialite provider.
+     */
+    private function registerOidcSocialiteProvider(): void
+    {
+        Event::listen(function (SocialiteWasCalled $event) {
+            $event->extendSocialite('oidc', \SocialiteProviders\OIDC\Provider::class);
+        });
+    }
+
+    /**
+     * Validate OAuth configuration at boot time for faster feedback.
+     * Skips validation in console to avoid breaking artisan commands.
+     */
+    private function validateOAuthConfiguration(): void
+    {
+        if ($this->app->runningInConsole()) {
+            return;
+        }
+
+        $this->performOAuthValidation();
+    }
+
+    /**
+     * Perform OAuth configuration validation.
+     *
+     * @internal Exposed as public for testing purposes
+     */
+    public function performOAuthValidation(): void
+    {
+        // OIDC role mapping only ever targets the built-in roles (the env keys
+        // are OAUTH_OIDC_ROLE_MAP_ADMIN/MEMBER/OPERATOR/VIEWER), so validate
+        // against those names without a per-request roles query.
+        $validRoles = ['admin', 'member', 'operator', 'viewer'];
+        $defaultRole = config('oauth.default_role');
+
+        if ($defaultRole && ! in_array($defaultRole, $validRoles)) {
+            throw new \InvalidArgumentException(
+                "Invalid OAUTH_DEFAULT_ROLE '{$defaultRole}'. Must be one of: ".implode(', ', $validRoles)
+            );
+        }
+
+        $providers = config('oauth.providers', []);
+
+        foreach ($providers as $name => $providerConfig) {
+            if (! ($providerConfig['enabled'] ?? false)) {
+                continue;
+            }
+
+            if (empty($providerConfig['client_id']) || empty($providerConfig['client_secret'])) {
+                throw new \InvalidArgumentException(
+                    "OAuth provider '{$name}' is enabled but missing client_id or client_secret"
+                );
+            }
+
+            if ($name === 'oidc' && empty($providerConfig['base_url'])) {
+                throw new \InvalidArgumentException(
+                    "OAuth provider 'oidc' is enabled but missing required base URL"
+                );
+            }
+        }
+
+        // Validate role mapping: strict mode requires at least one mapping (only when OIDC is enabled)
+        if (config('oauth.providers.oidc.enabled', false)) {
+            $roleMapping = config('oauth.role_mapping', []);
+            $hasMapping = false;
+            foreach ($validRoles as $role) {
+                if (trim((string) ($roleMapping[$role] ?? '')) !== '') {
+                    $hasMapping = true;
+                    break;
+                }
+            }
+
+            if (! empty($roleMapping['strict']) && ! $hasMapping) {
+                throw new \InvalidArgumentException(
+                    'OAUTH_OIDC_ROLE_STRICT is enabled but no role mappings are configured. Set at least one of: OAUTH_OIDC_ROLE_MAP_ADMIN, OAUTH_OIDC_ROLE_MAP_MEMBER, OAUTH_OIDC_ROLE_MAP_OPERATOR, OAUTH_OIDC_ROLE_MAP_VIEWER'
+                );
+            }
+        }
+    }
+}

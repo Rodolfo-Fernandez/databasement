@@ -1,0 +1,67 @@
+name: Deploy Documentation
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: "pages-docs"
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: docs
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          # Full history + tags: prepare-versions.sh snapshots one docs
+          # version per 1.x minor from the latest patch tag of each minor
+          fetch-depth: 0
+          # Keep the token out of .git/config while npm ci runs third-party
+          # scripts; the deploy action authenticates via its own token input
+          persist-credentials: false
+
+      - name: Extract version from tag
+        id: version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 20
+          cache: 'npm'
+          cache-dependency-path: docs/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Prepare versioned docs from tags
+        run: ./scripts/prepare-versions.sh
+
+      - name: Build documentation
+        run: npm run build
+        env:
+          DOCS_VERSION: ${{ steps.version.outputs.version }}
+          ANALYTICS_SNIPPET: ${{ vars.DOCS_ANALYTICS_SNIPPET }}
+
+      - name: Deploy to gh-pages
+        # Clean deploy: removes stale docs files from the branch on every
+        # deploy, but never touches the Helm repository files
+        uses: JamesIves/github-pages-deploy-action@v4
+        with:
+          folder: docs/build
+          branch: gh-pages
+          clean-exclude: |
+            charts/**
+            index.yaml
+            artifacthub-repo.yml

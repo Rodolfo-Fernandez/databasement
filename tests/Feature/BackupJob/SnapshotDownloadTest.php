@@ -1,0 +1,247 @@
+<?php
+
+use App\Enums\Ability;
+use App\Enums\SnapshotFileStatus;
+use App\Models\DatabaseServer;
+use App\Models\User;
+use App\Models\Volume;
+use App\Services\Backup\BackupJobFactory;
+use App\Services\Backup\Filesystems\Awss3Filesystem;
+
+test('can download snapshot from local storage', function () {
+    // Allow case for download-snapshots: that ability alone enables a download.
+    $user = User::factory()->withAbilities([Ability::DownloadSnapshots->value])->create();
+
+    $volume = Volume::factory()->local()->create();
+    $tempDir = $volume->config['path'];
+
+    $backupFilename = 'test-backup.sql.gz';
+    $backupFilePath = $tempDir.'/'.$backupFilename;
+    file_put_contents($backupFilePath, 'test backup content');
+
+    $server = DatabaseServer::factory()->create([
+        'database_names' => ['test_db'],
+    ]);
+    $server->backups->first()->volumes()->sync([$volume->id]);
+
+    $factory = app(BackupJobFactory::class);
+    $snapshots = $factory->createSnapshots($server->backups->first(), 'manual', $user->id);
+    $snapshot = $snapshots[0];
+    $snapshot->update([
+        'filename' => $backupFilename,
+        'file_size' => filesize($backupFilePath),
+    ]);
+    $snapshot->files()->update(['status' => SnapshotFileStatus::Completed]);
+    $snapshot->job->markCompleted();
+
+    $response = $this->actingAs($user)
+        ->get(route('snapshots.download', $snapshot));
+
+    $response->assertOk()
+        ->assertDownload($backupFilename);
+});
+
+test('download refuses a filename that escapes the volume root', function () {
+    // The filename is reported by the agent that produced the backup, so the
+    // download must not follow it outside the volume it belongs to.
+    $user = User::factory()->withAbilities([Ability::DownloadSnapshots->value])->create();
+
+    $volume = Volume::factory()->local()->create();
+    $secret = dirname($volume->config['path']).'/agent-traversal-secret.txt';
+    file_put_contents($secret, 'top secret');
+
+    $server = DatabaseServer::factory()->create(['database_names' => ['test_db']]);
+    $server->backups->first()->volumes()->sync([$volume->id]);
+
+    $snapshot = pendingSnapshot($server, $user->id);
+    $snapshot->update(['filename' => '../'.basename($secret), 'file_size' => filesize($secret)]);
+    $snapshot->files()->update(['status' => SnapshotFileStatus::Completed]);
+    $snapshot->job->markCompleted();
+
+    $this->actingAs($user)
+        ->get(route('snapshots.download', $snapshot))
+        ->assertNotFound();
+
+    unlink($secret);
+});
+
+test('download returns 404 when local file is missing', function () {
+    $user = User::factory()->withAbilities([Ability::DownloadSnapshots->value])->create();
+
+    $volume = Volume::factory()->local()->create();
+
+    $server = DatabaseServer::factory()->create([
+        'database_names' => ['test_db'],
+    ]);
+    $server->backups->first()->volumes()->sync([$volume->id]);
+
+    $factory = app(BackupJobFactory::class);
+    $snapshots = $factory->createSnapshots($server->backups->first(), 'manual', $user->id);
+    $snapshot = $snapshots[0];
+    $snapshot->update([
+        'filename' => 'nonexistent-backup.sql.gz',
+        'file_size' => 1024,
+    ]);
+    $snapshot->files()->update(['status' => SnapshotFileStatus::Completed]);
+    $snapshot->job->markCompleted();
+
+    $response = $this->actingAs($user)
+        ->get(route('snapshots.download', $snapshot));
+
+    $response->assertNotFound();
+    expect($response->exception->getMessage())->toContain('readable by the application user');
+});
+
+test('can download snapshot from s3 storage redirects to presigned url', function () {
+    $user = User::factory()->withAbilities([Ability::DownloadSnapshots->value])->create();
+
+    $volume = Volume::factory()->s3()->create();
+
+    $server = DatabaseServer::factory()->create([
+        'database_names' => ['test_db'],
+    ]);
+    $server->backups->first()->volumes()->sync([$volume->id]);
+
+    $factory = app(BackupJobFactory::class);
+    $snapshots = $factory->createSnapshots($server->backups->first(), 'manual', $user->id);
+    $snapshot = $snapshots[0];
+    $snapshot->update([
+        'filename' => 'test-backup.sql.gz',
+        'file_size' => 1024,
+    ]);
+    $snapshot->files()->update(['status' => SnapshotFileStatus::Completed]);
+    $snapshot->job->markCompleted();
+
+    $mockS3Filesystem = Mockery::mock(Awss3Filesystem::class);
+    $mockS3Filesystem->shouldReceive('getPresignedUrl')
+        ->once()
+        ->with(
+            $volume->getDecryptedConfig(),
+            $snapshot->filename,
+            Mockery::any()
+        )
+        ->andReturn('https://test-bucket.s3.amazonaws.com/test-backup.sql.gz?presigned=token');
+
+    app()->instance(Awss3Filesystem::class, $mockS3Filesystem);
+
+    $response = $this->actingAs($user)
+        ->get(route('snapshots.download', $snapshot));
+
+    $response->assertRedirect('https://test-bucket.s3.amazonaws.com/test-backup.sql.gz?presigned=token');
+});
+
+test('s3 download presigned url includes volume prefix in key path', function () {
+    $user = User::factory()->withAbilities([Ability::DownloadSnapshots->value])->create();
+
+    $volume = Volume::factory()->create([
+        'type' => 's3',
+        'config' => [
+            'bucket' => 'my-backup-bucket',
+            'prefix' => 'backups/production',
+            'region' => 'us-east-1',
+            'access_key_id' => 'test-key',
+            'secret_access_key' => 'test-secret',
+            'custom_endpoint' => 'http://minio:9000',
+            'public_endpoint' => 'https://127.0.0.1:9022',
+            'use_path_style_endpoint' => true,
+        ],
+    ]);
+
+    $server = DatabaseServer::factory()->create([
+        'database_names' => ['myapp_db'],
+    ]);
+    $server->backups->first()->volumes()->sync([$volume->id]);
+
+    $factory = app(BackupJobFactory::class);
+    $snapshots = $factory->createSnapshots($server->backups->first(), 'manual', $user->id);
+    $snapshot = $snapshots[0];
+    $snapshot->update([
+        'filename' => 'myapp-backup-2024-01-13.sql.gz',
+        'file_size' => 2048,
+    ]);
+    $snapshot->files()->update(['status' => SnapshotFileStatus::Completed]);
+    $snapshot->job->markCompleted();
+
+    $response = $this->actingAs($user)
+        ->get(route('snapshots.download', $snapshot));
+
+    $response->assertRedirectContains('https://127.0.0.1:9022/my-backup-bucket/backups/production/myapp-backup-2024-01-13.sql.gz');
+});
+
+test('without download-snapshots, downloading is forbidden', function () {
+    $user = User::factory()->withAllAbilitiesExcept(Ability::DownloadSnapshots->value)->create();
+
+    $volume = Volume::factory()->local()->create();
+    $server = DatabaseServer::factory()->create(['database_names' => ['test_db']]);
+    $server->backups->first()->volumes()->sync([$volume->id]);
+
+    $snapshot = app(BackupJobFactory::class)
+        ->createSnapshots($server->backups->first(), 'manual', $user->id)[0];
+    $snapshot->update(['filename' => 'test-backup.sql.gz', 'file_size' => 1024]);
+    $snapshot->files()->update(['status' => SnapshotFileStatus::Completed]);
+    $snapshot->job->markCompleted();
+
+    $this->actingAs($user)
+        ->get(route('snapshots.download', $snapshot))
+        ->assertForbidden();
+});
+
+test('guests cannot download snapshots', function () {
+    $volume = Volume::factory()->local()->create();
+    $server = DatabaseServer::factory()->create(['database_names' => ['test_db']]);
+    $server->backups->first()->volumes()->sync([$volume->id]);
+
+    $factory = app(BackupJobFactory::class);
+    $snapshots = $factory->createSnapshots($server->backups->first(), 'manual');
+    $snapshot = $snapshots[0];
+    $snapshot->job->markCompleted();
+
+    $response = $this->get(route('snapshots.download', $snapshot));
+
+    $response->assertRedirect(route('login'));
+});
+
+test('download picks the copy selected via the file query param', function () {
+    $user = User::factory()->withAbilities([Ability::DownloadSnapshots->value])->create();
+
+    $volumeA = Volume::factory()->local()->create();
+    $volumeB = Volume::factory()->local()->create();
+
+    $server = DatabaseServer::factory()->create(['database_names' => ['test_db']]);
+    $server->backups->first()->volumes()->sync([$volumeA->id, $volumeB->id]);
+
+    $snapshot = app(BackupJobFactory::class)
+        ->createSnapshots($server->backups->first()->fresh(), 'manual', $user->id)[0];
+    $snapshot->update(['filename' => 'multi-copy.sql.gz', 'file_size' => 1024]);
+    $snapshot->files()->update(['status' => SnapshotFileStatus::Completed]);
+    $snapshot->job->markCompleted();
+
+    // Only volume B actually holds the file.
+    $fileOnB = $snapshot->files()->where('volume_id', $volumeB->id)->firstOrFail();
+    file_put_contents($volumeB->config['path'].'/multi-copy.sql.gz', 'copy B content');
+
+    $this->actingAs($user)
+        ->get(route('snapshots.download', [$snapshot, 'file' => $fileOnB->id]))
+        ->assertOk()
+        ->assertDownload('multi-copy.sql.gz');
+});
+
+test('download rejects a file id that belongs to another snapshot', function () {
+    $user = User::factory()->withAbilities([Ability::DownloadSnapshots->value])->create();
+
+    $volume = Volume::factory()->local()->create();
+    $server = DatabaseServer::factory()->create(['database_names' => ['test_db']]);
+    $server->backups->first()->volumes()->sync([$volume->id]);
+
+    $snapshot = pendingSnapshot($server, $user->id);
+    $snapshot->update(['filename' => 'a.sql.gz']);
+    $snapshot->files()->update(['status' => SnapshotFileStatus::Completed]);
+    $snapshot->job->markCompleted();
+
+    $otherSnapshot = \App\Models\Snapshot::factory()->create();
+    $foreignFile = $otherSnapshot->files()->firstOrFail();
+
+    $this->actingAs($user)
+        ->get(route('snapshots.download', [$snapshot, 'file' => $foreignFile->id]))
+        ->assertNotFound();
+});

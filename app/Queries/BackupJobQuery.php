@@ -1,0 +1,167 @@
+<?php
+
+namespace App\Queries;
+
+use App\Models\BackupJob;
+use App\Models\Snapshot;
+use App\Support\Formatters;
+use Illuminate\Database\Eloquent\Builder;
+use Spatie\QueryBuilder\AllowedFilter;
+use Spatie\QueryBuilder\AllowedSort;
+use Spatie\QueryBuilder\QueryBuilder;
+
+class BackupJobQuery
+{
+    private const RELATIONSHIPS = [
+        'snapshot.databaseServer',
+        'snapshot.triggeredBy',
+        'restore.snapshot.databaseServer',
+        'restore.targetServer',
+        'restore.triggeredBy',
+    ];
+
+    private const ALLOWED_SORT_COLUMNS = [
+        'created_at',
+        'started_at',
+        'completed_at',
+        'status',
+        'snapshot_size',
+        'duration_ms',
+        'type',
+    ];
+
+    /**
+     * @return QueryBuilder<BackupJob>
+     */
+    public static function make(): QueryBuilder
+    {
+        return QueryBuilder::for(BackupJob::query()->forCurrentOrg())
+            ->with(self::RELATIONSHIPS)
+            ->allowedFilters(
+                AllowedFilter::exact('status'),
+                AllowedFilter::callback('type', function (Builder $query, $value) {
+                    if ($value === 'backup') {
+                        $query->whereHas('snapshot');
+                    } elseif ($value === 'restore') {
+                        $query->whereHas('restore');
+                    }
+                }),
+                AllowedFilter::callback('search', self::applySearch(...)),
+            )
+            ->allowedSorts(
+                AllowedSort::field('created_at'),
+                AllowedSort::field('started_at'),
+                AllowedSort::field('completed_at'),
+                AllowedSort::field('status'),
+            )
+            ->defaultSort('-created_at');
+    }
+
+    /**
+     * Build query from manual parameters (for Livewire).
+     *
+     * @param  array<string>  $statusFilter
+     * @return Builder<BackupJob>
+     */
+    public static function buildFromParams(
+        ?string $search = null,
+        array $statusFilter = [],
+        string $typeFilter = 'all',
+        string $serverFilter = '',
+        bool $fileMissing = false,
+        string $sortColumn = 'created_at',
+        string $sortDirection = 'desc'
+    ): Builder {
+        $query = BackupJob::query()
+            ->with(self::RELATIONSHIPS)
+            ->addSelect('backup_jobs.*');
+
+        $query->forCurrentOrg();
+
+        $query
+            ->addSelect([
+                'snapshot_size' => Snapshot::select('file_size')
+                    ->whereColumn('backup_job_id', 'backup_jobs.id')
+                    ->limit(1),
+            ])
+            // Add computed 'type' column: 1 = backup (has snapshot), 0 = restore
+            ->selectRaw('(EXISTS (SELECT 1 FROM snapshots WHERE snapshots.backup_job_id = backup_jobs.id)) as is_backup')
+            ->when($search, function (Builder $query) use ($search) {
+                self::applySearch($query, $search);
+            })
+            ->when(! empty($statusFilter), function (Builder $query) use ($statusFilter) {
+                $query->whereIn('status', $statusFilter);
+            })
+            ->when($typeFilter !== '', function (Builder $query) use ($typeFilter) {
+                if ($typeFilter === 'backup') {
+                    $query->whereHas('snapshot');
+                } else {
+                    $query->whereHas('restore');
+                }
+            })
+            ->when($serverFilter !== '', function (Builder $query) use ($serverFilter) {
+                self::applyServerFilter($query, $serverFilter);
+            })
+            ->when($fileMissing, function (Builder $query) {
+                $query->whereHas('snapshot', function (Builder $query): void {
+                    /** @var Builder<Snapshot> $query */
+                    $query->fileMissing();
+                });
+            });
+
+        $direction = Formatters::sortDirection($sortDirection);
+        $sortColumn = Formatters::sortColumn($sortColumn, self::ALLOWED_SORT_COLUMNS);
+
+        // Handle sorting
+        if ($sortColumn === 'snapshot_size') {
+            $query->orderBy('snapshot_size', $direction);
+        } elseif ($sortColumn === 'duration_ms') {
+            $query->orderBy('duration_ms', $direction);
+        } elseif ($sortColumn === 'type') {
+            $query->orderBy('is_backup', $direction);
+        } else {
+            $query->orderBy($sortColumn, $direction);
+        }
+
+        return $query;
+    }
+
+    /**
+     * @param  Builder<BackupJob>  $query
+     */
+    private static function applySearch(Builder $query, string $search): void
+    {
+        $query->where(function (Builder $q) use ($search) {
+            $q->whereHas('snapshot.databaseServer', function (Builder $sq) use ($search) {
+                $sq->whereRaw('name LIKE ?', ["%{$search}%"])
+                    ->orWhereRaw('host LIKE ?', ["%{$search}%"]);
+            })
+                ->orWhereHas('snapshot', function (Builder $sq) use ($search) {
+                    $sq->whereRaw('database_name LIKE ?', ["%{$search}%"]);
+                })
+                ->orWhereHas('restore.targetServer', function (Builder $sq) use ($search) {
+                    $sq->whereRaw('name LIKE ?', ["%{$search}%"]);
+                })
+                ->orWhereHas('restore', function (Builder $sq) use ($search) {
+                    $sq->whereRaw('schema_name LIKE ?', ["%{$search}%"]);
+                });
+        });
+    }
+
+    /**
+     * Filter by database server ID (for both backups and restores).
+     *
+     * @param  Builder<BackupJob>  $query
+     */
+    public static function applyServerFilter(Builder $query, string $serverId): void
+    {
+        $query->where(function (Builder $q) use ($serverId) {
+            $q->whereHas('snapshot', function ($sq) use ($serverId) {
+                $sq->whereRaw('database_server_id = ?', [$serverId]);
+            })
+                ->orWhereHas('restore', function ($sq) use ($serverId) {
+                    $sq->whereRaw('target_server_id = ?', [$serverId]);
+                });
+        });
+    }
+}

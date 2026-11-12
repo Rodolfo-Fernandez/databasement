@@ -1,0 +1,66 @@
+includes:
+    - vendor/larastan/larastan/extension.neon
+    # Teaches PHPStan Pest's functional API (it/test/expect, closure $this) and
+    # adds Pest-aware rules. Registered explicitly because this project does not
+    # use phpstan/extension-installer.
+    - vendor/pestphp/pest-plugin-phpstan/extension.neon
+
+# laravel-actions' PHPStan support, minus its extension.neon's
+# RunThrowTypeExtension: that one narrows `Action::run()` to the @throws of
+# handle(), so a catch-all for infrastructure failures around a run() call is
+# reported as a dead catch. The rest types run() as handle() and checks its
+# arguments; without it every run() returns mixed.
+services:
+    -
+        class: Lorisleiva\Actions\PHPStan\ActionHelper
+    -
+        class: Lorisleiva\Actions\PHPStan\RunReturnTypeExtension
+        tags:
+            - phpstan.broker.expressionTypeResolverExtension
+    -
+        class: Lorisleiva\Actions\PHPStan\RunParameterValidationRule
+        tags:
+            - phpstan.rules.rule
+
+parameters:
+
+    paths:
+        - app/
+
+    scanFiles:
+        - _ide_helper_models.php
+
+    # Level 9 is the highest level
+    level: 7
+
+    checkModelProperties: true
+    noEnvCallsOutsideOfConfig: true
+
+    excludePaths:
+        - app/Services/adminer_object.php
+
+    ignoreErrors:
+        - '#Call to an undefined method Illuminate\\Database\\Eloquent\\Builder.*::allowedFilters\(\)#'
+        - '#should return .* but returns .* \$this\(.*\)#'
+        # Bouncer's vendor Role model has no IDE-helper metadata, so its known
+        # columns are unknown to static analysis. Listed explicitly so genuine
+        # typos on other properties are still reported.
+        - '#Access to an undefined property Silber\\Bouncer\\Database\\Role::\$(id|name|title|scope|abilities|built_in)\b#'
+        # Writes to Role can't be column-checked (no metadata). Scoped to the
+        # exact call sites so the same mistakes elsewhere still surface.
+        -
+            message: '#Builder<Silber\\Bouncer\\Database\\Role>::where\(\) expects .*, ''name'' given\.#'
+            path: app/Livewire/Configuration/Roles.php
+            count: 1
+        -
+            message: '#Builder<Silber\\Bouncer\\Database\\Role>::where\(\) expects .*, ''name'' given\.#'
+            path: app/Http/Middleware/DemoModeMiddleware.php
+            count: 1
+        -
+            message: '#Builder<Silber\\Bouncer\\Database\\Role>::create\(\) expects array<model property of Silber\\Bouncer\\Database\\Role, mixed>, array<string, string> given\.#'
+            path: app/Actions/Role/CreateRoleAction.php
+            count: 1
+        -
+            message: '#Model::update\(\) expects array<model property of Silber\\Bouncer\\Database\\Role, mixed>, array<string, string> given\.#'
+            path: app/Actions/Role/UpdateRoleAction.php
+            count: 1

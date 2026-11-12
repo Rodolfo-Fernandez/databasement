@@ -1,0 +1,137 @@
+<?php
+
+namespace App\Models;
+
+use App\Models\Scopes\DatabaseServerOrganizationScope;
+use Database\Factories\ScheduledRestoreFactory;
+use Illuminate\Database\Eloquent\Concerns\HasUlids;
+use Illuminate\Database\Eloquent\Factories\HasFactory;
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\BelongsTo;
+use Illuminate\Database\Eloquent\Relations\HasMany;
+use Illuminate\Database\Eloquent\Relations\HasOne;
+
+/**
+ * @mixin IdeHelperScheduledRestore
+ */
+class ScheduledRestore extends Model
+{
+    /** @use HasFactory<ScheduledRestoreFactory> */
+    use HasFactory, HasUlids;
+
+    public const string SKIP_NO_SNAPSHOT = 'no_snapshot';
+
+    public const string SKIP_PREVIOUS_IN_FLIGHT = 'previous_in_flight';
+
+    /**
+     * Tenancy is inherited from the target server; the source server is
+     * constrained to the same organization at validation time.
+     */
+    protected static function booted(): void
+    {
+        static::addGlobalScope(new DatabaseServerOrganizationScope('target_server_id'));
+    }
+
+    /**
+     * What a skip reason means, for people. A run rejected outright stores
+     * the rejection itself as its reason.
+     */
+    public static function skipReasonLabel(string $reason): string
+    {
+        return match ($reason) {
+            self::SKIP_NO_SNAPSHOT => __('No snapshot is available to restore from yet.'),
+            self::SKIP_PREVIOUS_IN_FLIGHT => __('A previous run of this scheduled restore is still in progress.'),
+            default => $reason,
+        };
+    }
+
+    protected $fillable = [
+        'name',
+        'source_server_id',
+        'source_database_name',
+        'target_server_id',
+        'schema_name',
+        'backup_schedule_id',
+        'options',
+        'enabled',
+        'last_executed_at',
+        'last_skip_reason',
+    ];
+
+    /**
+     * The column defaults, so a scheduled restore just created reads them too.
+     *
+     * @var array<string, mixed>
+     */
+    protected $attributes = [
+        'enabled' => true,
+    ];
+
+    /**
+     * @return array<string, string>
+     */
+    protected function casts(): array
+    {
+        return [
+            'options' => 'array',
+            'enabled' => 'boolean',
+            'last_executed_at' => 'datetime',
+        ];
+    }
+
+    /**
+     * Get a scheduled restore option value.
+     */
+    public function getOption(string $key, mixed $default = null): mixed
+    {
+        return is_array($this->options) ? ($this->options[$key] ?? $default) : $default;
+    }
+
+    /**
+     * @return BelongsTo<DatabaseServer, ScheduledRestore>
+     */
+    public function sourceServer(): BelongsTo
+    {
+        return $this->belongsTo(DatabaseServer::class, 'source_server_id');
+    }
+
+    /**
+     * @return BelongsTo<DatabaseServer, ScheduledRestore>
+     */
+    public function targetServer(): BelongsTo
+    {
+        return $this->belongsTo(DatabaseServer::class, 'target_server_id');
+    }
+
+    /**
+     * Whether running this would restore over the application's own database.
+     */
+    public function targetsAppDatabase(): bool
+    {
+        return $this->targetServer->isAppDatabase($this->schema_name);
+    }
+
+    /**
+     * @return HasOne<Restore, ScheduledRestore>
+     */
+    public function lastRestore(): HasOne
+    {
+        return $this->hasOne(Restore::class)->latestOfMany();
+    }
+
+    /**
+     * @return BelongsTo<BackupSchedule, ScheduledRestore>
+     */
+    public function backupSchedule(): BelongsTo
+    {
+        return $this->belongsTo(BackupSchedule::class);
+    }
+
+    /**
+     * @return HasMany<Restore, ScheduledRestore>
+     */
+    public function restores(): HasMany
+    {
+        return $this->hasMany(Restore::class);
+    }
+}

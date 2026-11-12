@@ -1,0 +1,84 @@
+<?php
+
+namespace App\Actions\Fortify;
+
+use App\Actions\Role\AssignRoleToUserAction;
+use App\Models\Organization;
+use App\Models\User;
+use App\Services\DemoBackupService;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Validator;
+use Illuminate\Validation\Rule;
+use Laravel\Fortify\Contracts\CreatesNewUsers;
+
+class CreateNewUser implements CreatesNewUsers
+{
+    use PasswordValidationRules;
+
+    public function __construct(
+        private readonly DemoBackupService $demoBackupService
+    ) {}
+
+    /**
+     * Validate and create a newly registered user.
+     *
+     * Only the first user can register via this route.
+     * All other users must be invited by an admin.
+     *
+     * @param  array<string, string>  $input
+     */
+    public function create(array $input): User
+    {
+        // Only allow registration if no users exist (first admin)
+        if (User::count() > 0) {
+            abort(403, __('Registration is closed. Please contact an administrator for an invitation.'));
+        }
+
+        Validator::make($input, [
+            'name' => ['required', 'string', 'max:255'],
+            'email' => [
+                'required',
+                'string',
+                'email',
+                'max:255',
+                Rule::unique(User::class),
+            ],
+            'password' => $this->passwordRules(),
+        ])->validate();
+
+        $createDemoBackup = ! empty($input['create_demo_backup']);
+
+        // Ensure default org exists (migration creates it, but handle fresh install)
+        $defaultOrg = Organization::firstOrCreate(
+            ['is_default' => true],
+            ['name' => 'Default']
+        );
+
+        // First user is always super_admin
+        $user = User::create([
+            'name' => $input['name'],
+            'email' => $input['email'],
+            'password' => $input['password'],
+            'super_admin' => true,
+            'invitation_accepted_at' => now(),
+        ]);
+
+        // Attach to main org and grant the Admin role (in addition to the
+        // super_admin flag). The built-in roles are seeded by migration.
+        $user->organizations()->attach($defaultOrg->id);
+        AssignRoleToUserAction::run($user, 'admin', $defaultOrg);
+
+        if ($createDemoBackup) {
+            try {
+                $this->demoBackupService->createDemoBackup($defaultOrg);
+            } catch (\Throwable $e) {
+                // Log the error but don't fail registration
+                Log::warning('Failed to create demo backup during registration', [
+                    'error' => $e->getMessage(),
+                ]);
+            }
+        }
+
+        return $user;
+    }
+}

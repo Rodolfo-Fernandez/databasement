@@ -1,0 +1,47 @@
+<?php
+
+namespace App\Notifications;
+
+use App\Enums\NotificationType;
+use App\Models\Snapshot;
+use App\Notifications\Concerns\DescribesSnapshot;
+use App\Notifications\Concerns\HasChannelRouting;
+use App\Support\Formatters;
+use Illuminate\Notifications\Notification;
+
+/**
+ * Sent when a backup exceeded its volume's storage limit but the volume is in
+ * notify-only mode, so the backup was uploaded anyway. Delivered to every
+ * configured channel because a volume is an installation-wide resource.
+ */
+class StorageLimitWarningNotification extends Notification
+{
+    use DescribesSnapshot, HasChannelRouting;
+
+    public function __construct(
+        public Snapshot $snapshot,
+        public string $warning,
+        public string $volumeName,
+    ) {}
+
+    public function getMessage(): NotificationMessage
+    {
+        return new NotificationMessage(
+            type: NotificationType::Failure,
+            title: '⚠️ '.__('Storage limit reached on volume: :volume', ['volume' => $this->volumeName]),
+            body: __('A backup of ":server" on volume ":volume" exceeded its storage limit. It was still uploaded because the volume is set to notify only: free up space to stay within the limit.', [
+                'server' => $this->snapshot->databaseServer->name,
+                'volume' => $this->volumeName,
+            ]),
+            actionText: '🔗 '.__('View Job Details'),
+            actionUrl: $this->snapshotUrl(),
+            footerText: '🕐 '.Formatters::humanDate(now()),
+            fields: [
+                ...$this->snapshotFields(),
+                __('Volume') => $this->volumeName,
+            ],
+            errorMessage: $this->warning,
+            errorLabel: '⚠️ '.__('Storage Details'),
+        );
+    }
+}

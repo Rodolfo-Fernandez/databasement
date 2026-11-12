@@ -1,0 +1,326 @@
+<?php
+
+namespace App\Services\Backup;
+
+use App\Enums\BackupJobStatus;
+use App\Enums\CompressionType;
+use App\Enums\DatabaseSelectionMode;
+use App\Enums\DatabaseType;
+use App\Enums\SnapshotFileStatus;
+use App\Facades\AppConfig;
+use App\Models\Backup;
+use App\Models\BackupJob;
+use App\Models\DatabaseServer;
+use App\Models\Restore;
+use App\Models\Scopes\OrganizationScope;
+use App\Models\Snapshot;
+use App\Models\Volume;
+use App\Services\Backup\Databases\DatabaseProvider;
+use App\Services\NotificationService;
+use Illuminate\Support\Collection;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Validation\ValidationException;
+use RuntimeException;
+
+class BackupJobFactory
+{
+    public function __construct(
+        protected DatabaseProvider $databaseProvider
+    ) {}
+
+    /**
+     * Create backup job(s) for one backup configuration.
+     *
+     * For selected mode: Returns array with one Snapshot per selected database
+     * For all mode: Returns array with Snapshot per database on server
+     * For pattern mode: Returns array with Snapshot per matching database
+     * For SQLite: Returns array with one Snapshot per configured path on the server
+     *
+     * @param  'manual'|'scheduled'  $method
+     * @return Snapshot[]
+     */
+    public function createSnapshots(
+        Backup $backup,
+        string $method,
+        ?int $triggeredByUserId = null
+    ): array {
+        $server = $backup->databaseServer;
+        $snapshots = [];
+
+        if ($server->database_type === DatabaseType::SQLITE) {
+            foreach ($backup->database_names ?? [] as $databasePath) {
+                $snapshots[] = $this->createSnapshot($backup, $databasePath, $method, $triggeredByUserId);
+            }
+
+            return $snapshots;
+        }
+
+        if ($server->database_type === DatabaseType::REDIS) {
+            $snapshots[] = $this->createSnapshot($backup, 'all', $method, $triggeredByUserId);
+
+            return $snapshots;
+        }
+
+        // Agent-backed servers defer discovery to the agent — the web app
+        // can't reach the database itself.
+        if ($server->agent_id && in_array($backup->database_selection_mode, [DatabaseSelectionMode::All, DatabaseSelectionMode::Pattern], true)) {
+            return [];
+        }
+
+        try {
+            $databases = match ($backup->database_selection_mode) {
+                DatabaseSelectionMode::All => $this->databaseProvider->listDatabasesForServer($server),
+                DatabaseSelectionMode::Pattern => DatabaseServer::filterDatabasesByPattern(
+                    $this->databaseProvider->listDatabasesForServer($server),
+                    $backup->database_include_pattern ?? '',
+                ),
+                default => $backup->database_names ?? [],
+            };
+        } catch (\Throwable $e) {
+            $this->recordPreflightFailure($backup, $method, $triggeredByUserId, $e);
+
+            return [];
+        }
+
+        if (empty($databases)) {
+            $this->recordPreflightFailure($backup, $method, $triggeredByUserId, new RuntimeException('No database on the server matches this backup configuration.'));
+
+            return [];
+        }
+
+        foreach ($databases as $databaseName) {
+            $snapshots[] = $this->createSnapshot($backup, $databaseName, $method, $triggeredByUserId);
+        }
+
+        return $snapshots;
+    }
+
+    /**
+     * Create a single snapshot for one database within a specific backup config.
+     *
+     * @param  'manual'|'scheduled'  $method
+     */
+    public function createSnapshot(
+        Backup $backup,
+        string $databaseName,
+        string $method,
+        ?int $triggeredByUserId = null
+    ): Snapshot {
+        $server = $backup->databaseServer;
+        $volumes = $backup->volumes;
+
+        if ($volumes->isEmpty()) {
+            throw new \RuntimeException("Backup [{$backup->id}] has no target volumes; nothing to back up to.");
+        }
+
+        $snapshot = DB::transaction(function () use ($backup, $server, $volumes, $databaseName, $method, $triggeredByUserId) {
+            $job = BackupJob::create(['status' => BackupJobStatus::Pending]);
+
+            $snapshot = Snapshot::create([
+                'backup_job_id' => $job->id,
+                'database_server_id' => $server->id,
+                'backup_id' => $backup->id,
+                'filename' => '',
+                'file_size' => 0,
+                'checksum' => null,
+                'started_at' => now(),
+                'database_name' => $databaseName,
+                'database_type' => $server->database_type,
+                'compression_type' => CompressionType::from(AppConfig::get('backup.compression')),
+                'method' => $method,
+                'metadata' => $this->snapshotMetadata($server, $databaseName, $volumes),
+                'triggered_by_user_id' => $triggeredByUserId,
+            ]);
+
+            // The run's target volumes are frozen here — editing the backup
+            // config later must not change what an in-flight run uploads to.
+            foreach ($volumes as $volume) {
+                $snapshot->files()->create([
+                    'volume_id' => $volume->id,
+                    'status' => SnapshotFileStatus::Pending,
+                ]);
+            }
+
+            return $snapshot;
+        });
+
+        $snapshot->load(['job', 'files.volume', 'databaseServer']);
+
+        return $snapshot;
+    }
+
+    /**
+     * Record a pre-flight failure (e.g. database unreachable when listing
+     * databases for All/Pattern modes) as a failed snapshot so monitoring
+     * dashboards and notifications can pick it up.
+     *
+     * @param  'manual'|'scheduled'  $method
+     */
+    public function recordPreflightFailure(
+        Backup $backup,
+        string $method,
+        ?int $triggeredByUserId,
+        \Throwable $exception,
+    ): void {
+        $databaseName = match ($backup->database_selection_mode) {
+            DatabaseSelectionMode::All => '(all databases)',
+            DatabaseSelectionMode::Pattern => $backup->database_include_pattern ?: '(pattern)',
+            default => '(preflight)',
+        };
+
+        $snapshot = $this->createSnapshot($backup, $databaseName, $method, $triggeredByUserId);
+        $snapshot->job->log("Pre-flight failed: {$exception->getMessage()}", 'error', [
+            'exception' => get_class($exception),
+        ]);
+        $snapshot->job->markFailed($exception);
+
+        app(NotificationService::class)->notifyBackupFailed($snapshot, $exception);
+    }
+
+    /**
+     * Create a BackupJob and Restore for a snapshot restore operation.
+     *
+     * @param  array<string, mixed>  $options
+     *
+     * @throws ValidationException
+     */
+    public function createRestore(
+        Snapshot $snapshot,
+        DatabaseServer $targetServer,
+        string $schemaName,
+        ?int $triggeredByUserId = null,
+        array $options = [],
+        ?string $scheduledRestoreId = null,
+        ?string $snapshotFileId = null,
+    ): Restore {
+        $snapshot->loadMissing('job');
+        if ($snapshot->job->status !== BackupJobStatus::Completed
+            || $snapshot->files()->completed()->fileExists()->doesntExist()) {
+            throw ValidationException::withMessages([
+                'snapshot_id' => 'Snapshot is not completed and cannot be restored.',
+            ]);
+        }
+
+        if ($snapshotFileId !== null
+            && $snapshot->files()->completed()->fileExists()->whereKey($snapshotFileId)->doesntExist()) {
+            throw ValidationException::withMessages([
+                'snapshot_file_id' => 'The selected source copy is not available for restore.',
+            ]);
+        }
+
+        if ($snapshot->database_type !== $targetServer->database_type) {
+            throw ValidationException::withMessages([
+                'snapshot_id' => 'Snapshot database type does not match the target server.',
+            ]);
+        }
+
+        if ($targetServer->agent_id !== null) {
+            $reachableCopies = $snapshot->files()->completed()->fileExists()->reachableByAgent();
+
+            if ($snapshotFileId !== null) {
+                $reachableCopies->whereKey($snapshotFileId);
+            }
+
+            if ($reachableCopies->doesntExist()) {
+                throw ValidationException::withMessages([
+                    $snapshotFileId !== null ? 'snapshot_file_id' : 'snapshot_id' => 'The target server runs through a remote agent, which cannot read snapshots stored on a local volume.',
+                ]);
+            }
+        }
+
+        // Tenant boundary, enforced here because scheduled restores reach this
+        // factory from the CLI, where no organization scope is active.
+        $sourceOrganizationId = DatabaseServer::withoutGlobalScope(OrganizationScope::class)
+            ->whereKey($snapshot->database_server_id)
+            ->value('organization_id');
+
+        if ($sourceOrganizationId !== $targetServer->organization_id) {
+            throw ValidationException::withMessages([
+                'snapshot_id' => 'Snapshot belongs to a different organization than the target server.',
+            ]);
+        }
+
+        if ($targetServer->isAppDatabase($schemaName)) {
+            throw ValidationException::withMessages([
+                'schema_name' => 'Cannot restore over the application database.',
+            ]);
+        }
+
+        $restore = DB::transaction(function () use ($snapshot, $targetServer, $schemaName, $options, $triggeredByUserId, $scheduledRestoreId, $snapshotFileId) {
+            $job = BackupJob::create(['status' => BackupJobStatus::Pending]);
+
+            return Restore::create([
+                'backup_job_id' => $job->id,
+                'snapshot_id' => $snapshot->id,
+                'snapshot_file_id' => $snapshotFileId,
+                'target_server_id' => $targetServer->id,
+                'schema_name' => $schemaName,
+                'options' => $options ?: null,
+                'triggered_by_user_id' => $triggeredByUserId,
+                'scheduled_restore_id' => $scheduledRestoreId,
+            ]);
+        });
+
+        $restore->load(['job', 'snapshot.files.volume', 'snapshot.databaseServer', 'targetServer']);
+
+        return $restore;
+    }
+
+    /**
+     * Generate metadata array for a snapshot.
+     * Sensitive fields (passwords) are excluded from the volume configs.
+     *
+     * @param  Collection<int, Volume>  $volumes
+     * @return array{database_server: array{host: string|null, port: int|null, username: string|null, database_name: string, ssh_tunnel: array{enabled: bool, host?: string, port?: int, username?: string, auth_type?: string}}, volumes: list<array{id: string, type: string, config: array<string, mixed>}>, agent?: array{name: string}, dump_format?: string, dump_privileges?: bool}
+     */
+    private function snapshotMetadata(DatabaseServer $server, string $databaseName, Collection $volumes): array
+    {
+        $sshTunnel = ['enabled' => false];
+        if ($server->requiresSshTunnel() && $server->sshConfig !== null) {
+            $safeSshConfig = $server->sshConfig->getSafe();
+            $sshTunnel = [
+                'enabled' => true,
+                'host' => $safeSshConfig['host'] ?? null,
+                'port' => $safeSshConfig['port'] ?? 22,
+                'username' => $safeSshConfig['username'] ?? null,
+                'auth_type' => $safeSshConfig['auth_type'] ?? 'password',
+            ];
+        }
+
+        $metadata = [
+            'database_server' => [
+                'host' => $server->host,
+                'port' => $server->port,
+                'username' => $server->username,
+                'database_name' => $databaseName,
+                'ssh_tunnel' => $sshTunnel,
+            ],
+            'volumes' => array_values($volumes->map(fn (Volume $volume) => [
+                'id' => $volume->id,
+                'type' => $volume->type,
+                'config' => $volume->getSafeConfig(),
+            ])->all()),
+        ];
+
+        // Record the agent name when the backup runs through a remote agent,
+        // so the logs modal can show how the job was executed.
+        if ($server->agent_id !== null && $server->agent !== null) {
+            $metadata['agent'] = ['name' => $server->agent->name];
+        }
+
+        // Record dump format for restore-time dispatch. Absent → plain (default for legacy snapshots).
+        if ($server->database_type === DatabaseType::POSTGRESQL
+            && $server->getExtraConfig('dump_format') === 'custom') {
+            $metadata['dump_format'] = 'custom';
+        }
+
+        // Record whether ownership/privilege information was preserved in the dump.
+        // Absent → stripped via --no-owner/--no-privileges (default for legacy snapshots).
+        if ($server->database_type === DatabaseType::POSTGRESQL
+            && (bool) $server->getExtraConfig('dump_privileges')) {
+            $metadata['dump_privileges'] = true;
+        }
+
+        return $metadata;
+    }
+}

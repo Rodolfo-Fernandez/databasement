@@ -1,0 +1,133 @@
+<?php
+
+namespace Tests\Support;
+
+use App\Services\Backup\ShellProcessor;
+
+/**
+ * Test double for ShellProcessor that captures commands without executing them
+ * Useful for testing services that build shell commands
+ */
+class TestShellProcessor extends ShellProcessor
+{
+    public array $executedCommands = [];
+
+    /** @var array<int, array<string, string>> */
+    public array $executedEnv = [];
+
+    public function process(string $command, array $env = [], ?string $workingDirectory = null): string
+    {
+        // Capture the command and env
+        $this->executedCommands[] = $command;
+        $this->executedEnv[] = $env;
+
+        // Simulate file creation based on command patterns
+        $this->simulateCommandEffects($command, $workingDirectory);
+
+        return 'fake output';
+    }
+
+    /**
+     * Simulate side effects of commands (creating files)
+     */
+    private function simulateCommandEffects(string $command, ?string $workingDirectory): void
+    {
+        // For a dump piped into a compressor, run from the dump's directory: the archive is the compressor's last argument
+        // Matches: { ( <dump> ); echo $? > '<status>'; } | gzip -6 -c > 'file.sql.gz' && exit ...
+        if (str_starts_with($command, '{ ( ')) {
+            if (preg_match('/\'([^\']+)\' && exit /', $command, $matches)) {
+                file_put_contents($workingDirectory.'/'.$matches[1], 'fake compressed data');
+            }
+
+            return;
+        }
+
+        // For mysqldump/pg_dump: extract output path and create fake dump file
+        if (preg_match('/>\s*([^\s]+)$/', $command, $matches)
+            || preg_match('/\s--result-file=(\'[^\']+\')/', $command, $matches)) {
+            $outputPath = trim($matches[1], '"\'');
+            if ($outputPath && $outputPath !== '&1') {
+                file_put_contents($outputPath, "-- Fake database dump\nCREATE TABLE test (id INT);\n");
+            }
+        }
+
+        // For gzip compression: extract input path and create .gz file
+        // Matches: gzip -6 '/path/to/file' or gzip '/path/to/file'
+        if (preg_match('/^gzip\s+(?:-\d+\s+)?[\'"]?([^\'"]+)[\'"]?$/', $command, $matches)) {
+            $inputPath = $matches[1];
+            $gzPath = $inputPath.'.gz';
+            if (! file_exists($gzPath)) {
+                file_put_contents($gzPath, 'fake compressed data');
+            }
+        }
+
+        // For gzip decompression: extract .gz path and create decompressed file
+        // Matches: gzip -d '/path/to/file.gz'
+        if (preg_match('/^gzip\s+-d\s+[\'"]?([^\'"]+)[\'"]?$/', $command, $matches)) {
+            $gzPath = $matches[1];
+            $decompressedPath = preg_replace('/\.gz$/', '', $gzPath);
+            file_put_contents($decompressedPath, "-- Fake decompressed data\nCREATE TABLE test (id INT);\n");
+        }
+
+        // For zstd compression: extract input path and create .zst file
+        // Matches: zstd -3 --rm '/path/to/file'
+        if (preg_match('/^zstd\s+-\d+\s+--rm\s+[\'"]?([^\'"]+)[\'"]?$/', $command, $matches)) {
+            $inputPath = $matches[1];
+            $zstPath = $inputPath.'.zst';
+            if (! file_exists($zstPath)) {
+                file_put_contents($zstPath, 'fake compressed data');
+            }
+        }
+
+        // For zstd decompression: extract .zst path and create decompressed file
+        // Matches: zstd -d --rm '/path/to/file.zst'
+        if (preg_match('/^zstd\s+-d\s+--rm\s+[\'"]?([^\'"]+)[\'"]?$/', $command, $matches)) {
+            $zstPath = $matches[1];
+            $decompressedPath = preg_replace('/\.zst$/', '', $zstPath);
+            file_put_contents($decompressedPath, "-- Fake decompressed data\nCREATE TABLE test (id INT);\n");
+        }
+
+        // For 7z encrypted compression: extract output path and create .7z file
+        // Matches: 7z a -t7z -mx=6 -mhe=on ... 'output.7z' 'input'
+        if (preg_match('/^7z\s+a\s+-t7z\s+-mx=\d+\s+-mhe=on\s+.*?[\'"]?([^\s\'"]+\.7z)[\'"]?\s+/', $command, $matches)) {
+            $outputPath = $matches[1];
+            if (! file_exists($outputPath)) {
+                file_put_contents($outputPath, 'fake 7z compressed data');
+            }
+        }
+
+        // For 7z extraction: extract archive path and create decompressed file
+        // Matches: 7z x -y -o'/path' [-p'password'] '/path/file.ext'
+        if (preg_match('/^7z\s+x\s+-y\s+-o[\'"]?([^\s\'"]+)[\'"]?\s+(?:-p[\'"]?[^\s\'"]*[\'"]?\s+)?[\'"]?([^\s\'"]+)[\'"]?$/', $command, $matches)) {
+            $outputDir = $matches[1];
+            $archivePath = $matches[2];
+            // 7z restores the archived basename, which BackupTask always wrote
+            // as dump.<extension>. The archive is named <name>.<extension>.7z,
+            // so the dump extension is the archive's second-to-last suffix.
+            $extension = pathinfo(basename($archivePath, '.7z'), PATHINFO_EXTENSION) ?: 'sql';
+            $decompressedPath = rtrim($outputDir, '/').'/dump.'.$extension;
+            file_put_contents($decompressedPath, "-- Fake decompressed data\nCREATE TABLE test (id INT);\n");
+        }
+    }
+
+    /**
+     * Get all executed commands
+     */
+    public function getCommands(): array
+    {
+        return $this->executedCommands;
+    }
+
+    public function hasCommand($command): bool
+    {
+        return in_array($command, $this->executedCommands);
+    }
+
+    /**
+     * Clear all captured commands
+     */
+    public function clearCommands(): void
+    {
+        $this->executedCommands = [];
+    }
+}

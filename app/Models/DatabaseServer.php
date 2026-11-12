@@ -1,0 +1,399 @@
+<?php
+
+namespace App\Models;
+
+use App\Enums\DatabaseType;
+use App\Enums\NotificationChannelSelection;
+use App\Enums\NotificationTrigger;
+use App\Exceptions\Backup\EncryptionException;
+use App\Models\Scopes\OrganizationScope;
+use Database\Factories\DatabaseServerFactory;
+use Illuminate\Contracts\Encryption\DecryptException;
+use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Database\Eloquent\Collection;
+use Illuminate\Database\Eloquent\Concerns\HasUlids;
+use Illuminate\Database\Eloquent\Factories\HasFactory;
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\BelongsTo;
+use Illuminate\Database\Eloquent\Relations\BelongsToMany;
+use Illuminate\Database\Eloquent\Relations\HasMany;
+
+/**
+ * @mixin IdeHelperDatabaseServer
+ */
+class DatabaseServer extends Model
+{
+    /** @use HasFactory<DatabaseServerFactory> */
+    use HasFactory;
+
+    use HasUlids;
+
+    /**
+     * Transient state passed from factories to configure the server's default
+     * Backup row in an afterCreating hook. Never persisted.
+     *
+     * @var array<string, mixed>
+     */
+    public array $pendingBackupState = [];
+
+    /**
+     * Transient database_names used for connection testing (SQLite file paths
+     * or selected database list). Not persisted — lives on the Backup model.
+     *
+     * @var array<int, string>|null
+     */
+    public ?array $pendingDatabaseNames = null;
+
+    protected static function booted(): void
+    {
+        static::addGlobalScope(new OrganizationScope);
+    }
+
+    protected $fillable = [
+        'name',
+        'host',
+        'port',
+        'database_type',
+        'username',
+        'password',
+        'description',
+        'backups_enabled',
+        'ssh_config_id',
+        'agent_id',
+        'extra_config',
+        'managed_by',
+        'notification_trigger',
+        'notification_channel_selection',
+        'organization_id',
+    ];
+
+    protected $hidden = [
+        'password',
+    ];
+
+    protected function casts(): array
+    {
+        return [
+            'port' => 'integer',
+            'database_type' => DatabaseType::class,
+            'backups_enabled' => 'boolean',
+            'password' => 'encrypted',
+            'extra_config' => 'array',
+            'notification_trigger' => NotificationTrigger::class,
+            'notification_channel_selection' => NotificationChannelSelection::class,
+        ];
+    }
+
+    /**
+     * @return BelongsTo<Organization, DatabaseServer>
+     */
+    public function organization(): BelongsTo
+    {
+        return $this->belongsTo(Organization::class);
+    }
+
+    /**
+     * @return BelongsTo<Agent, DatabaseServer>
+     */
+    public function agent(): BelongsTo
+    {
+        return $this->belongsTo(Agent::class);
+    }
+
+    /**
+     * @return HasMany<Backup, DatabaseServer>
+     */
+    public function backups(): HasMany
+    {
+        return $this->hasMany(Backup::class);
+    }
+
+    /**
+     * @return HasMany<Snapshot, DatabaseServer>
+     */
+    public function snapshots(): HasMany
+    {
+        return $this->hasMany(Snapshot::class);
+    }
+
+    /**
+     * @return BelongsToMany<NotificationChannel, DatabaseServer>
+     */
+    public function notificationChannels(): BelongsToMany
+    {
+        return $this->belongsToMany(NotificationChannel::class, 'database_server_notification_channel');
+    }
+
+    /**
+     * @return BelongsTo<DatabaseServerSshConfig, DatabaseServer>
+     */
+    public function sshConfig(): BelongsTo
+    {
+        return $this->belongsTo(DatabaseServerSshConfig::class, 'ssh_config_id');
+    }
+
+    /**
+     * Get the decrypted password with proper exception handling.
+     *
+     * @throws EncryptionException
+     */
+    public function getDecryptedPassword(): string
+    {
+        try {
+            return $this->password ?? '';
+        } catch (DecryptException $e) { // @phpstan-ignore catch.neverThrown (DecryptException is thrown by Laravel's encrypted cast)
+            throw new EncryptionException(
+                'Unable to decrypt database password. The application key (APP_KEY) may have changed. Please update the password in the database server settings.',
+                previous: $e
+            );
+        }
+    }
+
+    /**
+     * Check if this server supports browsing via Adminer.
+     * Requires a compatible database type (MySQL, PostgreSQL, SQLite), no SSH, and no agent.
+     * Agent-backed servers are outbound-only and unreachable directly, so Adminer cannot connect.
+     */
+    public function supportsAdminer(): bool
+    {
+        return in_array($this->database_type, [DatabaseType::MYSQL, DatabaseType::POSTGRESQL, DatabaseType::SQLITE])
+            && $this->ssh_config_id === null
+            && $this->agent_id === null;
+    }
+
+    /**
+     * Check if this server requires an SSH tunnel for connections.
+     * SQLite servers never need SSH tunnels since they use local file paths.
+     */
+    public function requiresSshTunnel(): bool
+    {
+        return $this->database_type !== DatabaseType::SQLITE
+            && $this->ssh_config_id !== null;
+    }
+
+    /**
+     * Check if this server requires SFTP file transfer for backups/restores.
+     * Only applies to SQLite servers accessed via SSH.
+     */
+    public function requiresSftpTransfer(): bool
+    {
+        return $this->database_type === DatabaseType::SQLITE
+            && $this->ssh_config_id !== null;
+    }
+
+    /**
+     * The backup configuration a trigger request names, or the oldest one
+     * when it names none.
+     */
+    public function backupToTrigger(?string $backupId): ?Backup
+    {
+        return $backupId !== null
+            ? $this->backups->firstWhere('id', $backupId)
+            : $this->backups->sortBy('id')->first();
+    }
+
+    /**
+     * Servers as `x-select` / `x-choices` options, ordered by name.
+     *
+     * @param  (\Closure(Builder<self>): mixed)|null  $constrain  Narrows the servers listed
+     * @return array<int, array{id: string, name: string}>
+     */
+    public static function toSelectOptions(?\Closure $constrain = null): array
+    {
+        return self::query()
+            ->when($constrain, $constrain)
+            ->orderBy('name')
+            ->get()
+            ->map(fn (self $server): array => ['id' => $server->id, 'name' => $server->name])
+            ->all();
+    }
+
+    /**
+     * Create a temporary DatabaseServer instance for connection testing.
+     * This is not persisted to the database.
+     *
+     * @param  array<string, mixed>  $config
+     */
+    public static function forConnectionTest(array $config, ?DatabaseServerSshConfig $sshConfig = null): self
+    {
+        $server = new self;
+        $server->host = $config['host'] ?? '';
+        $server->port = (int) ($config['port'] ?? 3306);
+        $server->database_type = $config['database_type'] ?? 'mysql';
+        $server->username = $config['username'] ?? '';
+        $server->password = $config['password'] ?? '';
+        $server->pendingDatabaseNames = $config['database_names'] ?? null;
+        $server->extra_config = $config['extra_config'] ?? null;
+
+        if ($sshConfig !== null) {
+            $server->ssh_config_id = 'temp';
+            $server->setRelation('sshConfig', $sshConfig);
+        }
+
+        return $server;
+    }
+
+    /**
+     * Collect the list of database names/paths this server is currently
+     * configured to target: the transient pending list (during connection
+     * testing), otherwise the flattened, de-duplicated union of every related
+     * Backup's `database_names`.
+     *
+     * @return array<int, string>
+     */
+    public function resolveDatabaseNames(): array
+    {
+        if ($this->pendingDatabaseNames !== null) {
+            return $this->pendingDatabaseNames;
+        }
+
+        $backups = $this->relationLoaded('backups')
+            ? $this->backups
+            : $this->backups()->get();
+
+        $names = [];
+
+        foreach ($backups as $backup) {
+            foreach ($backup->database_names ?? [] as $name) {
+                if ($name !== '') {
+                    $names[] = $name;
+                }
+            }
+        }
+
+        return array_values(array_unique($names));
+    }
+
+    /**
+     * Get a short connection label for display (filename for SQLite, host:port for client-server).
+     */
+    public function getConnectionLabel(): string
+    {
+        if ($this->database_type === DatabaseType::SQLITE) {
+            return implode(', ', array_map('basename', $this->resolveDatabaseNames()));
+        }
+
+        return "{$this->host}:{$this->port}";
+    }
+
+    /**
+     * Get full connection details for popover/tooltip (full paths for SQLite, host:port for client-server).
+     */
+    public function getConnectionDetails(): string
+    {
+        if ($this->database_type === DatabaseType::SQLITE) {
+            return implode(', ', $this->resolveDatabaseNames());
+        }
+
+        return "{$this->host}:{$this->port}";
+    }
+
+    /**
+     * Get a type-specific config value from extra_config.
+     */
+    public function getExtraConfig(string $key, mixed $default = null): mixed
+    {
+        return $this->extra_config[$key] ?? $default;
+    }
+
+    /**
+     * Get SSH display name if configured (tunnel or SFTP), null otherwise.
+     */
+    public function getSshDisplayName(): ?string
+    {
+        if ($this->ssh_config_id === null || $this->sshConfig === null) {
+            return null;
+        }
+
+        return $this->sshConfig->getDisplayName();
+    }
+
+    /**
+     * Filter a list of database names using a regex pattern.
+     *
+     * @param  array<string>  $databases
+     * @return array<string>
+     */
+    public static function filterDatabasesByPattern(array $databases, string $pattern): array
+    {
+        if (! self::isValidDatabasePattern($pattern)) {
+            return [];
+        }
+
+        $regex = '/'.$pattern.'/i';
+
+        return array_values(array_filter($databases, fn (string $db) => preg_match($regex, $db) === 1));
+    }
+
+    /**
+     * Check if this server and schema match the application's own database.
+     */
+    public function isAppDatabase(string $schemaName): bool
+    {
+        $appDatabaseTypes = [DatabaseType::MYSQL, DatabaseType::POSTGRESQL];
+
+        if (! in_array($this->database_type, $appDatabaseTypes)) {
+            return false;
+        }
+
+        $defaultConnection = config('database.default');
+        $appDbDriver = config("database.connections.{$defaultConnection}.driver");
+
+        $driverToType = [
+            'mysql' => DatabaseType::MYSQL,
+            'mariadb' => DatabaseType::MYSQL,
+            'pgsql' => DatabaseType::POSTGRESQL,
+        ];
+
+        $appDbType = $driverToType[$appDbDriver] ?? null;
+
+        if ($appDbType !== $this->database_type) {
+            return false;
+        }
+
+        $appDbHost = config("database.connections.{$defaultConnection}.host");
+        $appDbPort = (int) config("database.connections.{$defaultConnection}.port");
+        $appDbDatabase = config("database.connections.{$defaultConnection}.database");
+
+        return $this->host === $appDbHost
+            && $this->port === $appDbPort
+            && $schemaName === $appDbDatabase;
+    }
+
+    /**
+     * Check if a regex pattern is valid.
+     */
+    public static function isValidDatabasePattern(string $pattern): bool
+    {
+        if ($pattern === '') {
+            return false;
+        }
+
+        set_error_handler(fn () => true);
+        $result = preg_match('/'.$pattern.'/i', '') !== false;
+        restore_error_handler();
+
+        return $result;
+    }
+
+    /**
+     * Check if this server should send notifications for the given event type.
+     */
+    public function shouldNotifyOn(string $event): bool
+    {
+        return $this->notification_trigger->shouldNotifyOn($event);
+    }
+
+    /**
+     * Resolve which notification channels to use for this server.
+     *
+     * @return Collection<int, NotificationChannel>
+     */
+    public function resolveNotificationChannels(): Collection
+    {
+        return match ($this->notification_channel_selection) {
+            NotificationChannelSelection::All => NotificationChannel::all(),
+            NotificationChannelSelection::Selected => $this->notificationChannels,
+        };
+    }
+}

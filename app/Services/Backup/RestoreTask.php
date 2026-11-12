@@ -1,0 +1,147 @@
+<?php
+
+namespace App\Services\Backup;
+
+use App\Contracts\BackupLogger;
+use App\Enums\DatabaseType;
+use App\Exceptions\Backup\RestoreException;
+use App\Facades\AppConfig;
+use App\Services\Backup\Compressors\CompressorFactory;
+use App\Services\Backup\Concerns\UsesSshTunnel;
+use App\Services\Backup\Databases\DatabaseInterface;
+use App\Services\Backup\Databases\DatabaseProvider;
+use App\Services\Backup\DTO\RestoreConfig;
+use App\Services\Backup\Filesystems\FilesystemProvider;
+use App\Services\SshTunnelService;
+use App\Support\Formatters;
+
+class RestoreTask
+{
+    use UsesSshTunnel;
+
+    public function __construct(
+        private readonly DatabaseProvider $databaseProvider,
+        private readonly ShellProcessor $shellProcessor,
+        private readonly FilesystemProvider $filesystemProvider,
+        private readonly CompressorFactory $compressorFactory,
+        private readonly SshTunnelService $sshTunnelService,
+        private readonly PostScriptRunner $postScriptRunner,
+    ) {}
+
+    protected function getSshTunnelService(): SshTunnelService
+    {
+        return $this->sshTunnelService;
+    }
+
+    /**
+     * Execute the core restore workflow: download, decompress, prepare, restore.
+     *
+     * This is the pure restore engine with no model persistence.
+     * `ProcessRestoreJob` and the remote agent delegate to this method.
+     */
+    public function execute(RestoreConfig $config, BackupLogger $logger): void
+    {
+        $this->shellProcessor->setLogger($logger);
+        $target = $config->targetServer;
+
+        try {
+            AppConfig::ensureBackupTmpFolderExists();
+
+            $this->validateCompatibility($target->databaseType, $config->snapshotDatabaseType);
+
+            if ($target->databaseType === DatabaseType::REDIS) {
+                throw new RestoreException('Automated restore is not supported for Redis/Valkey. Please restore manually.');
+            }
+
+            if ($target->requiresSshTunnel()) {
+                $this->establishSshTunnel($target, $logger);
+            }
+
+            $humanFileSize = Formatters::humanFileSize($config->snapshotFileSize);
+            $compressedFile = $config->workingDirectory.'/snapshot.'.$config->snapshotDatabaseType->dumpExtension($config->snapshotDumpFormat).'.'.$config->snapshotCompressionType->extension();
+            $compressor = $this->compressorFactory->make($config->snapshotCompressionType);
+
+            // Download snapshot from volume
+            $logger->log("Downloading snapshot ({$humanFileSize}) from volume: {$config->snapshotVolume->name}", 'info', [
+                'volume_type' => $config->snapshotVolume->type,
+                'source' => $config->snapshotFilename,
+                'destination' => $compressedFile,
+                'compression_type' => $config->snapshotCompressionType->value,
+            ]);
+            $transferStart = microtime(true);
+            $this->filesystemProvider->downloadFromConfig($config->snapshotVolume, $config->snapshotFilename, $compressedFile);
+            $transferDuration = Formatters::humanDuration(Formatters::elapsedMs($transferStart));
+            $logger->log('Download completed successfully in '.$transferDuration, 'success');
+
+            // Decompress the archive
+            $workingFile = $compressor->decompress($compressedFile);
+
+            $database = $this->databaseProvider->makeFromConfig(
+                $target,
+                $config->schemaName,
+                $this->getConnectionHost($target),
+                $this->getConnectionPort($target),
+                $config->snapshotDatabaseName,
+                $config->snapshotDumpFormat,
+                $config->snapshotDumpPrivileges,
+                $config->parallelRestore,
+            );
+
+            $this->prepareDatabase($database, $config->schemaName, $logger, $config->forceDatabase);
+
+            if ($config->ownerUser !== null && $database instanceof Databases\PostgresqlDatabase) {
+                $logger->log("Transferring ownership of database \"{$config->schemaName}\" to user \"{$config->ownerUser}\"", 'info');
+                $database->transferOwnership($config->schemaName, $config->ownerUser, $logger);
+            }
+
+            $logger->log('Restoring database from snapshot', 'info', [
+                'source_database' => $config->snapshotDatabaseName,
+                'target_database' => $config->schemaName,
+            ]);
+
+            $result = $database->restore($workingFile);
+            if ($result->command !== null) {
+                $this->shellProcessor->process($result->command);
+            }
+            if ($result->log !== null) {
+                $logger->log($result->log->message, $result->log->level, $result->log->context ?? []);
+            }
+
+            // Mark job as completed
+            $logger->log('Restore completed successfully', 'success');
+
+            $this->postScriptRunner->run(
+                $this->shellProcessor,
+                $logger,
+                'post-restore-script',
+                $config->postRestoreScript,
+                $config->workingDirectory,
+                [
+                    'RESTORE_SERVER_ID' => $target->serverId,
+                    'RESTORE_SERVER_NAME' => $target->serverName,
+                    'RESTORE_DATABASE_NAME' => $config->schemaName,
+                    'RESTORE_DATABASE_TYPE' => $target->databaseType->value,
+                    'RESTORE_SOURCE_DATABASE' => $config->snapshotDatabaseName,
+                    'RESTORE_SNAPSHOT_FILENAME' => $config->snapshotFilename,
+                    'RESTORE_VOLUME_NAME' => $config->snapshotVolume->name,
+                ],
+            );
+        } finally {
+            $this->cleanUpRun($config->workingDirectory, $logger);
+        }
+    }
+
+    private function validateCompatibility(DatabaseType $targetType, DatabaseType $snapshotType): void
+    {
+        if ($targetType !== $snapshotType) {
+            throw new RestoreException(
+                "Cannot restore {$snapshotType->value} snapshot to {$targetType->value} server"
+            );
+        }
+    }
+
+    protected function prepareDatabase(DatabaseInterface $database, string $schemaName, BackupLogger $logger, bool $forceDatabase = false): void
+    {
+        $database->prepareForRestore($schemaName, $logger, $forceDatabase);
+    }
+}

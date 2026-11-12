@@ -1,0 +1,105 @@
+<?php
+
+namespace App\Livewire\Volume;
+
+use App\Actions\Volume\DeleteVolumeAction;
+use App\Exceptions\Volume\VolumeFilesNotDeletedException;
+use App\Livewire\Concerns\ConfirmsDeletion;
+use App\Livewire\Concerns\FiltersAndPaginates;
+use App\Models\Snapshot;
+use App\Models\Volume;
+use App\Queries\VolumeQuery;
+use App\Traits\Toast;
+use Illuminate\Contracts\View\View;
+use Illuminate\Foundation\Auth\Access\AuthorizesRequests;
+use Livewire\Attributes\Title;
+use Livewire\Attributes\Url;
+use Livewire\Component;
+use Livewire\WithPagination;
+
+#[Title('Volumes')]
+class Index extends Component
+{
+    use AuthorizesRequests, ConfirmsDeletion, FiltersAndPaginates, Toast, WithPagination;
+
+    #[Url]
+    public string $search = '';
+
+    /** @var array<string, string> */
+    public array $sortBy = ['column' => 'created_at', 'direction' => 'desc'];
+
+    public int $deleteSnapshotCount = 0;
+
+    public bool $keepFiles = false;
+
+    /**
+     * @return array<int, array<string, mixed>>
+     */
+    public function headers(): array
+    {
+        return [
+            ['key' => 'name', 'label' => __('Name'), 'class' => 'w-64'],
+            ['key' => 'type', 'label' => __('Type'), 'class' => 'w-32'],
+            ['key' => 'config', 'label' => __('Configuration'), 'sortable' => false],
+            ['key' => 'usage', 'label' => __('Usage'), 'sortable' => false, 'class' => 'w-40'],
+            ['key' => 'created_at', 'label' => __('Created'), 'class' => 'w-40'],
+        ];
+    }
+
+    public function confirmDelete(string $id): void
+    {
+        $volume = $this->confirmDeletion(Volume::query(), $id);
+
+        // Only snapshots whose sole remaining copy lives on this volume are
+        // deleted with it; multi-volume snapshots survive.
+        $this->deleteSnapshotCount = Snapshot::query()
+            ->whereHas('files', fn ($q) => $q->whereRaw('volume_id = ?', [$volume->id]))
+            ->whereDoesntHave('files', fn ($q) => $q->whereRaw('volume_id != ?', [$volume->id]))
+            ->count();
+        $this->keepFiles = false;
+    }
+
+    public function delete(): void
+    {
+        $volume = $this->pendingDeletion(Volume::query());
+
+        if ($volume === null) {
+            return;
+        }
+
+        try {
+            DeleteVolumeAction::run($volume, $this->keepFiles);
+        } catch (VolumeFilesNotDeletedException) {
+            $this->closeDeletion();
+            $this->error(__('The volume was kept because some backup files could not be deleted from it. Try again, or delete it while keeping the files.'));
+
+            return;
+        }
+
+        $this->closeDeletion();
+
+        $this->success(__('Volume deleted successfully!'));
+    }
+
+    public function render(): View
+    {
+        $volumes = VolumeQuery::buildFromParams(
+            search: $this->search,
+            sortColumn: $this->sortBy['column'],
+            sortDirection: $this->sortBy['direction']
+        )->paginate(10);
+
+        return view('livewire.volume.index', [
+            'volumes' => $volumes,
+            'headers' => $this->headers(),
+        ]);
+    }
+
+    /**
+     * @return list<string>
+     */
+    protected function filterProperties(): array
+    {
+        return ['search'];
+    }
+}

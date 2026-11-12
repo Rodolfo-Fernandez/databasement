@@ -1,0 +1,116 @@
+<?php
+
+namespace App\Livewire\Dashboard;
+
+use App\Enums\BackupJobStatus;
+use App\Models\BackupJob;
+use Illuminate\Contracts\View\View;
+use Illuminate\Support\Carbon;
+use Illuminate\Support\Collection;
+use Livewire\Attributes\Lazy;
+use Livewire\Component;
+
+#[Lazy]
+class JobsActivityChart extends Component
+{
+    /** @var array<string, mixed> */
+    public array $chart = [];
+
+    public function mount(): void
+    {
+        $days = 14;
+        $displayTz = config('app.display_timezone');
+        $startDate = Carbon::now($displayTz)->subDays($days - 1)->startOfDay();
+
+        $jobs = BackupJob::forCurrentOrg()->where('created_at', '>=', $startDate)
+            ->get()
+            ->groupBy(fn ($job) => $job->created_at->copy()->setTimezone($displayTz)->format('Y-m-d'));
+
+        $labels = [];
+        $completed = [];
+        $failed = [];
+        $running = [];
+        $pending = [];
+
+        for ($i = 0; $i < $days; $i++) {
+            $date = $startDate->copy()->addDays($i);
+            $dateKey = $date->format('Y-m-d');
+            $labels[] = $date->format('M j');
+
+            /** @var Collection<int, BackupJob> $dayJobs */
+            $dayJobs = $jobs->get($dateKey, collect());
+
+            $completed[] = $dayJobs->where('status', BackupJobStatus::Completed)->count();
+            $failed[] = $dayJobs->where('status', BackupJobStatus::Failed)->count();
+            $running[] = $dayJobs->where('status', BackupJobStatus::Running)->count();
+            $pending[] = $dayJobs->where('status', BackupJobStatus::Pending)->count();
+        }
+
+        $this->chart = [
+            'type' => 'bar',
+            'data' => [
+                'labels' => $labels,
+                'datasets' => [
+                    [
+                        'label' => __('Completed'),
+                        'data' => $completed,
+                        'backgroundColor' => '--color-success',
+                        'borderRadius' => 4,
+                    ],
+                    [
+                        'label' => __('Failed'),
+                        'data' => $failed,
+                        'backgroundColor' => '--color-error',
+                        'borderRadius' => 4,
+                    ],
+                    [
+                        'label' => __('Running'),
+                        'data' => $running,
+                        'backgroundColor' => '--color-warning',
+                        'borderRadius' => 4,
+                    ],
+                    [
+                        'label' => __('Pending'),
+                        'data' => $pending,
+                        'backgroundColor' => '--color-info',
+                        'borderRadius' => 4,
+                    ],
+                ],
+            ],
+            'options' => [
+                'responsive' => true,
+                'maintainAspectRatio' => false,
+                'scales' => [
+                    'x' => [
+                        'stacked' => true,
+                        'grid' => [
+                            'display' => false,
+                        ],
+                    ],
+                    'y' => [
+                        'stacked' => true,
+                        'beginAtZero' => true,
+                        'ticks' => [
+                            'stepSize' => 1,
+                        ],
+                    ],
+                ],
+                'plugins' => [
+                    'legend' => [
+                        'position' => 'bottom',
+                    ],
+                ],
+            ],
+        ];
+    }
+
+    public function placeholder(): View
+    {
+        return view('components.lazy-placeholder', ['type' => 'chart']);
+    }
+
+    public function render(): View
+    {
+        return view('livewire.dashboard.jobs-activity-chart');
+    }
+}

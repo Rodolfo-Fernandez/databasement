@@ -1,0 +1,207 @@
+<?php
+
+namespace App\Services\Backup\Databases;
+
+use App\Contracts\BackupLogger;
+use App\Enums\DatabaseType;
+use App\Exceptions\Backup\ConnectionException;
+use App\Services\Backup\Databases\Concerns\TestsConnection;
+use App\Services\Backup\DTO\DatabaseOperationResult;
+use App\Support\Formatters;
+
+/**
+ * Microsoft SQL Server handler.
+ *
+ * Backup and restore both go through Microsoft's `sqlpackage` CLI
+ * (`/Action:Extract` produces a `.dacpac` with table data, `/Action:Publish`
+ * consumes one). We chose Extract/Publish over Export/Import because BACPAC
+ * validates against Azure SQL Database compatibility and rejects on-prem
+ * artefacts like `[NT AUTHORITY\SYSTEM]` Windows logins (SQL71627). DACPAC
+ * lets us exclude server-bound objects (users, logins, permissions) that we
+ * don't want to round-trip anyway.
+ *
+ * Connection tests, listDatabases, and the drop-before-publish step in
+ * prepareForRestore use the `pdo_sqlsrv` extension.
+ */
+class MssqlDatabase implements DatabaseInterface
+{
+    use TestsConnection;
+
+    /** @var array<string, mixed> */
+    private array $config;
+
+    private const array EXCLUDED_DATABASES = [
+        'master',
+        'tempdb',
+        'model',
+        'msdb',
+    ];
+
+    /**
+     * @param  array<string, mixed>  $config
+     */
+    public function setConfig(array $config): void
+    {
+        $this->config = $config;
+    }
+
+    public function dump(string $outputPath): DatabaseOperationResult
+    {
+        $parts = [
+            'sqlpackage',
+            '/Action:Extract',
+            '/TargetFile:'.escapeshellarg($outputPath),
+            '/SourceServerName:'.escapeshellarg($this->buildServerName()),
+            '/SourceDatabaseName:'.escapeshellarg($this->config['database']),
+            '/SourceUser:'.escapeshellarg($this->config['user']),
+            '/SourcePassword:'.escapeshellarg($this->config['pass']),
+            '/SourceTrustServerCertificate:True',
+            '/SourceEncryptConnection:True',
+            '/p:ExtractAllTableData=True',
+            '/p:ExtractReferencedServerScopedElements=False',
+            '/p:IgnoreUserLoginMappings=True',
+            '/p:IgnorePermissions=True',
+        ];
+
+        if (! empty($this->config['dump_flags'])) {
+            $parts[] = DatabaseOperationResult::escapeFlags($this->config['dump_flags'], DatabaseType::MSSQL);
+        }
+
+        return new DatabaseOperationResult(command: implode(' ', $parts));
+    }
+
+    public function restore(string $inputPath): DatabaseOperationResult
+    {
+        $sqlpackage = implode(' ', [
+            'sqlpackage',
+            '/Action:Publish',
+            '/SourceFile:'.escapeshellarg($inputPath),
+            '/TargetServerName:'.escapeshellarg($this->buildServerName()),
+            '/TargetDatabaseName:'.escapeshellarg($this->config['database']),
+            '/TargetUser:'.escapeshellarg($this->config['user']),
+            '/TargetPassword:'.escapeshellarg($this->config['pass']),
+            '/TargetTrustServerCertificate:True',
+            '/TargetEncryptConnection:True',
+        ]);
+
+        return new DatabaseOperationResult(command: $sqlpackage);
+    }
+
+    /**
+     * Publish will incrementally migrate an existing database, which is not
+     * what a restore should do, so we drop it first to guarantee a clean
+     * recreate. ALTER ... SET SINGLE_USER WITH ROLLBACK IMMEDIATE evicts any
+     * lingering sessions before the DROP.
+     */
+    public function prepareForRestore(string $schemaName, BackupLogger $logger, bool $forceDatabase = false): void
+    {
+        try {
+            $sql = self::dropDatabaseIfExistsSql($schemaName);
+            $logger->log("Ensuring target database {$schemaName} is dropped before sqlpackage Publish", 'info');
+            $logger->logCommand($sql, null, 0);
+            $this->createPdoForDatabase('master')->exec($sql);
+        } catch (\PDOException $e) {
+            throw new ConnectionException("Failed to prepare database: {$e->getMessage()}", 0, $e);
+        }
+    }
+
+    /**
+     * Build a T-SQL block that drops a database iff it currently exists,
+     * evicting any active sessions first. Shared with integration test
+     * helpers so the prod and test drop paths cannot drift apart.
+     */
+    public static function dropDatabaseIfExistsSql(string $name): string
+    {
+        $bracketed = '['.str_replace(']', ']]', $name).']';
+        $quoted = "'".str_replace("'", "''", $name)."'";
+
+        return "IF DB_ID({$quoted}) IS NOT NULL BEGIN "
+            ."ALTER DATABASE {$bracketed} SET SINGLE_USER WITH ROLLBACK IMMEDIATE; "
+            ."DROP DATABASE {$bracketed}; "
+            .'END';
+    }
+
+    public function listDatabases(): array
+    {
+        $pdo = $this->createPdo();
+
+        $statement = $pdo->query('SELECT name FROM sys.databases ORDER BY name');
+        if ($statement === false) {
+            throw new \RuntimeException('Failed to execute query: SELECT name FROM sys.databases');
+        }
+
+        $databases = $statement->fetchAll(\PDO::FETCH_COLUMN, 0);
+
+        return array_values(array_filter(
+            $databases,
+            fn ($db): bool => ! in_array($db, self::EXCLUDED_DATABASES, true),
+        ));
+    }
+
+    public function testConnection(): array
+    {
+        $startTime = microtime(true);
+
+        try {
+            $pdo = $this->createPdo();
+            $statement = $pdo->query('SELECT @@VERSION');
+            $version = $statement === false ? null : (string) $statement->fetchColumn();
+        } catch (\PDOException $e) {
+            return $this->driverConnectionFailure($e, $startTime);
+        }
+
+        $durationMs = Formatters::elapsedMs($startTime);
+        $shortVersion = $version !== null ? $this->extractShortVersion($version) : null;
+
+        return $this->connectionSucceededWithInfo($durationMs, [
+            'dbms' => $shortVersion ?? 'Microsoft SQL Server',
+            'version' => $version,
+        ]);
+    }
+
+    /**
+     * Create a PDO connection. Protected so tests can override it.
+     */
+    protected function createPdo(): \PDO
+    {
+        return $this->createPdoForDatabase($this->config['database'] ?? '');
+    }
+
+    protected function createPdoForDatabase(string $database): \PDO
+    {
+        $loginTimeout = (int) ($this->config['connect_timeout'] ?? 10);
+
+        $dsn = sprintf(
+            'sqlsrv:Server=%s;TrustServerCertificate=true;Encrypt=true;LoginTimeout=%d%s',
+            $this->buildServerName(),
+            $loginTimeout,
+            $database !== '' ? ';Database='.$database : '',
+        );
+
+        return new \PDO($dsn, $this->config['user'], $this->config['pass'], [
+            \PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION,
+        ]);
+    }
+
+    private function buildServerName(): string
+    {
+        return sprintf('%s,%d', $this->config['host'], (int) $this->config['port']);
+    }
+
+    /**
+     * Extract a short product name from the verbose `@@VERSION` string, e.g.
+     * "Microsoft SQL Server 2022 (RTM)".
+     */
+    private function extractShortVersion(string $fullVersion): ?string
+    {
+        if (preg_match('/Microsoft SQL [^\r\n]*?\d{4}[^\r\n(]*/i', $fullVersion, $matches) === 1) {
+            return trim($matches[0]);
+        }
+
+        if (preg_match('/Microsoft Azure SQL[^\r\n]*/i', $fullVersion, $matches) === 1) {
+            return trim($matches[0]);
+        }
+
+        return null;
+    }
+}

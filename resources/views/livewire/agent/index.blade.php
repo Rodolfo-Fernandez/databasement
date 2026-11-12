@@ -1,0 +1,108 @@
+<div>
+    <x-index-header :title="__('Agents')" :search="$search">
+        @can('create', App\Models\Agent::class)
+            <x-button :label="__('Add Agent')" :link="route('agents.create')" icon="o-plus" class="btn-primary btn-sm" wire:navigate />
+        @endcan
+
+        <x-slot:below>
+            <x-alert class="alert-info alert-vertical sm:alert-horizontal rounded-md mb-4" icon="o-information-circle">
+                {{ __('Agents run on remote networks to back up database servers that are not directly accessible. They are optional, you only need them if your servers are behind a firewall or private network.') }}
+                <x-slot:actions>
+                    <x-button
+                        :label="__('Learn more')"
+                        link="https://david-crty.github.io/databasement/user-guide/agents"
+                        external
+                        icon="o-book-open"
+                        class="btn-sm"
+                    />
+                </x-slot:actions>
+            </x-alert>
+        </x-slot:below>
+    </x-index-header>
+
+    <!-- TABLE -->
+    <x-card shadow>
+        <x-table :headers="$headers" :rows="$agents" :sort-by="$sortBy" with-pagination>
+            <x-slot:empty>
+                <div class="text-center text-base-content/50 py-8">
+                    @if($search)
+                        {{ __('No agents found matching your search.') }}
+                    @else
+                        {{ __('No agents yet.') }}
+                        @can('create', App\Models\Agent::class)
+                            <a href="{{ route('agents.create') }}" class="link link-primary" wire:navigate>
+                                {{ __('Create your first one.') }}
+                            </a>
+                        @endcan
+                    @endif
+                </div>
+            </x-slot:empty>
+
+            @scope('cell_name', $agent)
+                <div class="table-cell-primary">{{ $agent->name }}</div>
+            @endscope
+
+            @scope('cell_status', $agent)
+                <x-agent-status-indicator :status="$agent->connectionStatus()" />
+            @endscope
+
+            @scope('cell_version', $agent)
+                <x-agent-version-indicator :agent="$agent" />
+            @endscope
+
+            @scope('cell_servers', $agent)
+                <span class="badge badge-ghost badge-sm">{{ $agent->database_servers_count }}</span>
+            @endscope
+
+            @scope('cell_last_heartbeat_at', $agent)
+                @if($agent->last_heartbeat_at)
+                    <div class="table-cell-primary">{{ \App\Support\Formatters::humanDate($agent->last_heartbeat_at) }}</div>
+                    <div class="text-sm text-base-content/70">{{ $agent->last_heartbeat_at->diffForHumans() }}</div>
+                @else
+                    <span class="text-base-content/50">{{ __('Never') }}</span>
+                @endif
+            @endscope
+
+            @scope('cell_created_at', $agent)
+                <div class="table-cell-primary">{{ \App\Support\Formatters::humanDate($agent->created_at) }}</div>
+                <div class="text-sm text-base-content/70">{{ $agent->created_at->diffForHumans() }}</div>
+            @endscope
+
+            @scope('actions', $agent)
+                <div class="flex gap-2 justify-end">
+                    @can('update', $agent)
+                        <x-button
+                            icon="o-pencil"
+                            :link="route('agents.edit', $agent)"
+                            wire:navigate
+                            :tooltip="__('Edit')"
+                            class="btn-ghost btn-sm"
+                        />
+                    @endcan
+                    @can('delete', $agent)
+                        <x-button
+                            icon="o-trash"
+                            wire:click="confirmDelete('{{ $agent->id }}')"
+                            spinner
+                            :tooltip="__('Delete')"
+                            class="btn-ghost btn-sm text-error"
+                        />
+                    @endcan
+                </div>
+            @endscope
+        </x-table>
+    </x-card>
+
+    <!-- DELETE CONFIRMATION MODAL -->
+    <x-delete-confirmation-modal
+        :title="__('Delete Agent')"
+        :message="__('Are you sure you want to delete this agent? This action cannot be undone.')"
+        onConfirm="delete"
+    >
+        @if($deleteServerCount > 0)
+            <x-alert icon="o-exclamation-triangle" class="alert-warning mt-4">
+                {{ trans_choice(':count database server is assigned to this agent and will be unlinked.|:count database servers are assigned to this agent and will be unlinked.', $deleteServerCount, ['count' => $deleteServerCount]) }}
+            </x-alert>
+        @endif
+    </x-delete-confirmation-modal>
+</div>

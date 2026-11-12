@@ -1,0 +1,142 @@
+<div>
+    <x-header title="{{ __('API Tokens') }}" subtitle="{{ __('Manage your personal access tokens for API authentication') }}" size="text-2xl" separator class="mb-6">
+        <x-slot:actions>
+            <x-button label="{{ __('Create Token') }}" icon="o-plus" class="btn-primary" wire:click="openCreateModal" spinner />
+        </x-slot:actions>
+    </x-header>
+
+    <x-alert class="alert-info mb-4" icon="o-information-circle">
+        {{ __('API tokens authenticate requests to both the') }}
+        <a href="https://david-crty.github.io/databasement/user-guide/api" class="link link-primary font-medium" target="_blank">{{ __('REST API') }}</a>
+        {{ __('and the') }}
+        <a href="https://david-crty.github.io/databasement/user-guide/mcp" class="link link-primary font-medium" target="_blank">{{ __('MCP server') }}</a>.
+    </x-alert>
+
+    <x-card>
+        @if($tokens->isEmpty())
+            <div class="text-center text-base-content/50 py-8">
+                {{ __('No API tokens yet. Create one to get started.') }}
+            </div>
+        @else
+            <ul class="divide-y divide-base-200">
+                @foreach($tokens as $token)
+                    <li class="flex items-start justify-between gap-4 py-4 first:pt-0 last:pb-0">
+                        <div class="min-w-0 flex-1">
+                            <div class="font-semibold">{{ $token->name }}</div>
+
+                            <div class="mt-2">
+                                @if(in_array('*', $token->abilities ?? [], true))
+                                    <div class="flex flex-wrap items-center gap-1">
+                                        <span class="tooltip tooltip-right" data-tip="{{ __('Can do whatever its user can, and changes with their role.') }}">
+                                            <span class="badge badge-sm badge-outline gap-1 whitespace-nowrap">
+                                                <x-icon name="o-user" class="size-3.5" />
+                                                {{ __('Follow user permissions') }}
+                                            </span>
+                                        </span>
+                                        <x-ability-badges :abilities="$ownerAbilities[$token->tokenable_id] ?? []" />
+                                    </div>
+                                @else
+                                    <x-ability-badges :abilities="$token->abilities ?? []" />
+                                @endif
+                            </div>
+
+                            <div class="mt-3 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-base-content/60">
+                                @if($token->tokenable)
+                                    <span>
+                                        {{ $token->tokenable->name }}
+                                        <span class="badge badge-xs badge-neutral ml-1">{{ \Illuminate\Support\Str::headline($token->tokenable->currentOrgRoleName()) }}</span>
+                                    </span>
+                                @endif
+                                <span>{{ __('Created') }} {{ \App\Support\Formatters::humanDate($token->created_at) }}</span>
+                                <span>
+                                    @if($token->last_used_at)
+                                        {{ __('Last used') }} {{ \App\Support\Formatters::humanDate($token->last_used_at) }}
+                                    @else
+                                        {{ __('Never used') }}
+                                    @endif
+                                </span>
+                            </div>
+                        </div>
+
+                        @if($this->canDelete($token))
+                            <x-button
+                                icon="o-trash"
+                                wire:click="confirmDelete('{{ $token->id }}')"
+                                spinner
+                                :tooltip-left="__('Revoke')"
+                                class="btn-ghost btn-sm btn-square text-error"
+                            />
+                        @endif
+                    </li>
+                @endforeach
+            </ul>
+        @endif
+    </x-card>
+
+    {{-- Create Token Modal --}}
+    <x-modal wire:model="showCreateModal" title="{{ __('Create API Token') }}" separator>
+        <x-input
+            wire:model="tokenName"
+            label="{{ __('Token Name') }}"
+            placeholder="{{ __('e.g., CI/CD Pipeline, Backup Script') }}"
+            hint="{{ __('A descriptive name to identify this token') }}"
+        />
+
+        <label class="flex items-center gap-3 mt-4 cursor-pointer">
+            <x-toggle wire:model.live="fullAccess" class="toggle-primary" />
+            <span class="font-medium">{{ __('Follow user permissions') }}</span>
+        </label>
+
+        @unless($fullAccess)
+            <div class="mt-4">
+                <div class="text-sm text-base-content/70 mb-2">
+                    {{ __('Select the abilities this token is allowed to use.') }}
+                </div>
+                <x-ability-toggles :groups="$abilityGroups" model="tokenAbilities" />
+            </div>
+        @endunless
+
+        <x-slot:actions>
+            <x-button label="{{ __('Cancel') }}" wire:click="closeCreateModal" spinner />
+            <x-button label="{{ __('Create') }}" wire:click="createToken" class="btn-primary" spinner />
+        </x-slot:actions>
+    </x-modal>
+
+    {{-- Show New Token Modal --}}
+    <x-modal wire:model="showTokenModal" title="{{ __('API Token Created') }}" separator persistent>
+        <x-alert class="alert-warning mb-4" icon="o-exclamation-triangle">
+            {{ __('Make sure to copy your token now. You won\'t be able to see it again!') }}
+        </x-alert>
+
+        <div class="flex gap-2">
+            <div class="flex-1">
+                <x-input
+                    wire:model="newToken"
+                    readonly
+                    class="w-full font-mono text-sm"
+                />
+            </div>
+            <x-button
+                icon="o-clipboard-document"
+                class="btn-primary"
+                x-clipboard="$wire.newToken"
+                x-on:clipboard-copied="successToast('{{ __('Token copied to clipboard!') }}')"
+                tooltip="{{ __('Copy') }}"
+            />
+        </div>
+
+        <x-slot:actions>
+            <x-button label="{{ __('Done') }}" class="btn-primary" wire:click="closeTokenModal" spinner />
+        </x-slot:actions>
+    </x-modal>
+
+    {{-- Delete Confirmation Modal --}}
+    <x-confirm-modal
+        model="showDeleteModal"
+        :title="__('Revoke API Token')"
+        :message="__('Are you sure you want to revoke this token? Any applications using this token will no longer be able to access the API.')"
+        on-confirm="deleteToken"
+        on-cancel="closeDeleteModal"
+        :confirm-label="__('Revoke Token')"
+    />
+</div>

@@ -1,0 +1,388 @@
+<?php
+
+namespace App\Livewire\Snapshot;
+
+use App\Actions\Snapshot\DispatchSnapshotDeletionAction;
+use App\Enums\BackupJobStatus;
+use App\Enums\DatabaseType;
+use App\Livewire\Concerns\CancelsJobs;
+use App\Livewire\Concerns\FiltersAndPaginates;
+use App\Livewire\Concerns\HandlesJobLogsModal;
+use App\Models\BackupJob;
+use App\Models\DatabaseServer;
+use App\Models\Snapshot;
+use App\Queries\SnapshotQuery;
+use App\Traits\Toast;
+use Illuminate\Contracts\View\View;
+use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Foundation\Auth\Access\AuthorizesRequests;
+use Livewire\Attributes\Locked;
+use Livewire\Attributes\Title;
+use Livewire\Attributes\Url;
+use Livewire\Component;
+use Livewire\WithPagination;
+
+#[Title('Snapshots')]
+class Index extends Component
+{
+    use AuthorizesRequests, CancelsJobs, HandlesJobLogsModal, Toast, WithPagination;
+    use FiltersAndPaginates {
+        updated as updatedFilters;
+    }
+
+    #[Url]
+    public string $search = '';
+
+    #[Url]
+    public string $statusFilter = '';
+
+    #[Url]
+    public string $serverFilter = '';
+
+    #[Url]
+    public string $dbTypeFilter = '';
+
+    #[Url]
+    public string $flagFilter = '';
+
+    /** @var array<string, string> */
+    public array $sortBy = ['column' => 'created_at', 'direction' => 'desc'];
+
+    #[Locked]
+    public ?string $deleteSnapshotId = null;
+
+    public bool $showDeleteModal = false;
+
+    public bool $keepFiles = false;
+
+    /** @var list<string> */
+    public array $selected = [];
+
+    /**
+     * Extends the selection from the checked page to every snapshot matching
+     * the current filters.
+     */
+    public bool $selectAllMatching = false;
+
+    #[Locked]
+    public int $bulkDeleteCount = 0;
+
+    #[Locked]
+    public int $bulkSkipCount = 0;
+
+    #[Locked]
+    public ?string $downloadSnapshotId = null;
+
+    public bool $showDownloadModal = false;
+
+    #[Locked]
+    public ?string $editCommentSnapshotId = null;
+
+    public string $commentDraft = '';
+
+    /**
+     * Snapshot notifications sent before the flag dropdown existed link to
+     * `?fileMissing=1`, so keep those deeplinks working.
+     */
+    public function mount(): void
+    {
+        if ($this->flagFilter === '' && request()->query('fileMissing') !== null) {
+            $this->flagFilter = 'missing';
+        }
+    }
+
+    /**
+     * A filter change clears the selection, and so does unticking a row
+     * while every matching snapshot is selected.
+     *
+     * @param  string|array<string, mixed>  $property
+     */
+    public function updated(string|array $property): void
+    {
+        $this->updatedFilters($property);
+
+        if (is_string($property) && in_array($property, $this->filterProperties(), true)) {
+            $this->clearSelection();
+        }
+
+        if ($property === 'selected') {
+            $this->selectAllMatching = false;
+        }
+    }
+
+    public function clearSelection(): void
+    {
+        $this->reset('selected', 'selectAllMatching');
+    }
+
+    /**
+     * @return array<int, array<string, mixed>>
+     */
+    public function headers(): array
+    {
+        return [
+            ['key' => 'subject', 'label' => __('Database'), 'sortable' => false],
+            ['key' => 'status', 'label' => __('Status'), 'class' => 'w-36'],
+            ['key' => 'duration_ms', 'label' => __('Duration'), 'class' => 'w-24 whitespace-nowrap'],
+            ['key' => 'file_size', 'label' => __('Size'), 'class' => 'w-24 whitespace-nowrap'],
+            ['key' => 'created_at', 'label' => __('Created'), 'class' => 'w-48'],
+        ];
+    }
+
+    public function getSelectedJobProperty(): ?BackupJob
+    {
+        if (! $this->selectedJobId) {
+            return null;
+        }
+
+        // Bypass the OrganizationScope on DatabaseServer/Volume so cross-org
+        // deeplinks (e.g. a notification opened while the user is in another
+        // org) can still render the snapshot/server context in the logs modal.
+        // guardSelectedJob() applies the view policy to what comes back.
+        return $this->guardSelectedJob(BackupJob::with([
+            'snapshot.databaseServer' => fn ($q) => $q->withoutGlobalScopes(),
+            'snapshot.files.volume' => fn ($q) => $q->withoutGlobalScopes(),
+            'snapshot.triggeredBy',
+        ])->find($this->selectedJobId));
+    }
+
+    public function triggerRestore(string $snapshotId): void
+    {
+        $snapshot = Snapshot::findOrFail($snapshotId);
+
+        $this->authorize('restoreFrom', $snapshot);
+
+        $this->dispatch('open-restore-modal', mode: 'from-snapshot', snapshotId: $snapshotId);
+    }
+
+    /**
+     * @return array<int, array<string, mixed>>
+     */
+    public function statusOptions(): array
+    {
+        return BackupJobStatus::filterOptions();
+    }
+
+    /**
+     * @return array<int, array<string, mixed>>
+     */
+    public function flagOptions(): array
+    {
+        return [
+            ['id' => 'missing', 'name' => __('File missing')],
+            ['id' => 'locked', 'name' => __('Locked')],
+        ];
+    }
+
+    /**
+     * @return array<int, array<string, mixed>>
+     */
+    public function serverOptions(): array
+    {
+        return DatabaseServer::toSelectOptions();
+    }
+
+    /**
+     * @return array<int, array<string, mixed>>
+     */
+    public function dbTypeOptions(): array
+    {
+        return DatabaseType::toSelectOptions();
+    }
+
+    /**
+     * Open the volume picker for a snapshot stored on several volumes.
+     */
+    public function openDownloadModal(string $snapshotId): void
+    {
+        $snapshot = Snapshot::findOrFail($snapshotId);
+
+        $this->authorize('download', $snapshot);
+
+        $this->downloadSnapshotId = $snapshotId;
+        $this->showDownloadModal = true;
+    }
+
+    public function getDownloadSnapshotProperty(): ?Snapshot
+    {
+        if (! $this->downloadSnapshotId) {
+            return null;
+        }
+
+        return Snapshot::with('files.volume')->find($this->downloadSnapshotId);
+    }
+
+    public function editComment(string $snapshotId): void
+    {
+        $snapshot = Snapshot::findOrFail($snapshotId);
+
+        $this->authorize('update', $snapshot);
+
+        $this->editCommentSnapshotId = $snapshotId;
+        $this->commentDraft = (string) $snapshot->comment;
+        $this->resetValidation();
+    }
+
+    public function cancelEditComment(): void
+    {
+        $this->reset('editCommentSnapshotId', 'commentDraft');
+        $this->resetValidation();
+    }
+
+    public function saveComment(): void
+    {
+        $snapshot = Snapshot::findOrFail($this->editCommentSnapshotId);
+
+        $this->authorize('update', $snapshot);
+
+        $this->validate([
+            'commentDraft' => 'nullable|string|max:1000',
+        ]);
+
+        $comment = trim($this->commentDraft);
+
+        $snapshot->update([
+            'comment' => $comment !== '' ? $comment : null,
+        ]);
+
+        $this->reset('editCommentSnapshotId', 'commentDraft');
+
+        $this->success(__('Snapshot comment saved.'));
+    }
+
+    public function toggleLock(string $snapshotId): void
+    {
+        $snapshot = Snapshot::findOrFail($snapshotId);
+
+        $this->authorize('lock', $snapshot);
+
+        $snapshot->update(['locked' => ! $snapshot->locked]);
+
+        $this->success($snapshot->locked
+            ? __('Snapshot locked. Automatic cleanup will keep it.')
+            : __('Snapshot unlocked.'));
+    }
+
+    public function confirmDeleteSnapshot(string $snapshotId): void
+    {
+        $snapshot = Snapshot::findOrFail($snapshotId);
+
+        $this->authorize('delete', $snapshot);
+
+        $this->deleteSnapshotId = $snapshotId;
+        $this->keepFiles = false;
+        $this->showDeleteModal = true;
+    }
+
+    public function confirmBulkDelete(): void
+    {
+        $this->authorize('deleteAny', Snapshot::class);
+
+        $selectedCount = $this->selectedQuery()->count();
+        $this->bulkDeleteCount = $this->selectedQuery()->deletable()->count();
+        $this->bulkSkipCount = $selectedCount - $this->bulkDeleteCount;
+
+        $this->deleteSnapshotId = null;
+        $this->keepFiles = false;
+        $this->showDeleteModal = true;
+    }
+
+    /**
+     * Locked and in-progress snapshots in the selection are skipped. The
+     * deletion itself runs on the queue, since removing files from remote
+     * volumes can take a while.
+     */
+    public function bulkDeleteSnapshots(): void
+    {
+        $this->authorize('deleteAny', Snapshot::class);
+
+        $this->queueDeletion($this->selectedQuery());
+
+        $this->clearSelection();
+    }
+
+    public function deleteSnapshot(): void
+    {
+        if (! $this->deleteSnapshotId) {
+            return;
+        }
+
+        $snapshot = Snapshot::findOrFail($this->deleteSnapshotId);
+
+        $this->authorize('delete', $snapshot);
+
+        $this->queueDeletion(Snapshot::query()->whereKey($snapshot->id));
+
+        $this->deleteSnapshotId = null;
+    }
+
+    /**
+     * @param  Builder<Snapshot>  $query
+     */
+    private function queueDeletion(Builder $query): void
+    {
+        $this->showDeleteModal = false;
+
+        if (auth()->user()?->isDemo() === true) {
+            $this->warning(__('Demo mode is enabled. Snapshots are not deleted.'));
+
+            return;
+        }
+
+        $queued = DispatchSnapshotDeletionAction::run($query, $this->keepFiles);
+
+        $this->success(trans_choice(
+            ':count snapshot will be deleted in the background.|:count snapshots will be deleted in the background.',
+            $queued,
+            ['count' => $queued],
+        ));
+    }
+
+    /**
+     * @return Builder<Snapshot>
+     */
+    private function selectedQuery(): Builder
+    {
+        return $this->selectAllMatching
+            ? $this->filteredQuery()->reorder()
+            : Snapshot::query()->whereKey($this->selected);
+    }
+
+    /**
+     * @return Builder<Snapshot>
+     */
+    private function filteredQuery(): Builder
+    {
+        return SnapshotQuery::buildFromParams(
+            search: $this->search ?: null,
+            statusFilter: $this->statusFilter ?: 'all',
+            serverFilter: $this->serverFilter ?: null,
+            dbTypeFilter: $this->dbTypeFilter ?: null,
+            flagFilter: $this->flagFilter ?: null,
+            sortColumn: $this->sortBy['column'],
+            sortDirection: $this->sortBy['direction']
+        );
+    }
+
+    public function render(): View
+    {
+        $snapshots = $this->filteredQuery()->paginate(15);
+
+        return view('livewire.snapshot.index', [
+            'snapshots' => $snapshots,
+            'headers' => $this->headers(),
+            'statusOptions' => $this->statusOptions(),
+            'flagOptions' => $this->flagOptions(),
+            'serverOptions' => $this->serverOptions(),
+            'dbTypeOptions' => $this->dbTypeOptions(),
+        ]);
+    }
+
+    /**
+     * @return list<string>
+     */
+    protected function filterProperties(): array
+    {
+        return ['search', 'statusFilter', 'serverFilter', 'dbTypeFilter', 'flagFilter'];
+    }
+}

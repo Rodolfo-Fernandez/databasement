@@ -1,0 +1,217 @@
+<?php
+
+namespace App\Http\Requests\Api\V1;
+
+use App\Enums\DatabaseSelectionMode;
+use App\Enums\DatabaseType;
+use App\Enums\VolumeType;
+use App\Models\Backup;
+use App\Models\DatabaseServer;
+use App\Models\Volume;
+use App\Rules\ExcludedTableNames;
+use App\Rules\MaxBytes;
+use App\Rules\SafeDatabaseName;
+use App\Rules\SafeDatabasePath;
+use App\Rules\SafeDumpFlags;
+use App\Rules\SafeHost;
+use App\Rules\SafePath;
+use App\Services\CurrentOrganization;
+use Illuminate\Contracts\Validation\ValidationRule;
+use Illuminate\Foundation\Http\FormRequest;
+use Illuminate\Validation\Rule;
+use Illuminate\Validation\Validator;
+
+class SaveDatabaseServerRequest extends FormRequest
+{
+    public function authorize(): bool
+    {
+        return true;
+    }
+
+    /**
+     * Accept the legacy single `volume_id` key by normalizing it into
+     * `volume_ids` (deprecated — kept for v1 API backward compatibility).
+     */
+    protected function prepareForValidation(): void
+    {
+        $backups = $this->input('backups');
+
+        if (! is_array($backups)) {
+            return;
+        }
+
+        foreach ($backups as $index => $backup) {
+            if (is_array($backup) && ! array_key_exists('volume_ids', $backup) && isset($backup['volume_id'])) {
+                $backups[$index]['volume_ids'] = [$backup['volume_id']];
+            }
+        }
+
+        $this->merge(['backups' => $backups]);
+    }
+
+    /**
+     * @return array<string, ValidationRule|array<mixed>|string>
+     */
+    public function rules(): array
+    {
+        $type = $this->input('database_type');
+        $databaseType = is_string($type) ? DatabaseType::tryFrom($type) : null;
+
+        $rules = [
+            'name' => 'required|string|max:255',
+            'database_type' => ['required', 'string', Rule::in(array_map(fn (DatabaseType $t) => $t->value, DatabaseType::cases()))],
+            'description' => 'nullable|string|max:1000',
+            'backups_enabled' => 'boolean',
+            'ssh_config_id' => ['nullable', Rule::exists('database_server_ssh_configs', 'id')->where('organization_id', app(CurrentOrganization::class)->id())],
+            'agent_id' => ['nullable', Rule::exists('agents', 'id')->where('organization_id', app(CurrentOrganization::class)->id())],
+            'managed_by' => 'nullable|string|max:255',
+            // Every engine but SQLite appends these to its dump command.
+            'dump_flags' => ['nullable', 'string', 'max:500', new SafeDumpFlags($databaseType)],
+        ];
+
+        if ($databaseType !== null && $databaseType !== DatabaseType::SQLITE) {
+            $rules['host'] = ['required', 'string', 'max:255', new SafeHost($databaseType)];
+            $rules['port'] = 'required|integer|min:1|max:65535';
+            $rules['username'] = in_array($databaseType, [DatabaseType::MONGODB, DatabaseType::REDIS], true)
+                ? 'nullable|string|max:255'
+                : 'required|string|max:255';
+            $rules['password'] = 'nullable';
+        }
+
+        if ($databaseType === DatabaseType::POSTGRESQL) {
+            $rules['dump_format'] = ['nullable', 'string', Rule::in(['plain', 'custom'])];
+            $rules['dump_privileges'] = 'boolean';
+            $rules['connection_database'] = ['nullable', 'string', new MaxBytes(63), 'regex:'.DatabaseType::IDENTIFIER_PATTERN];
+        }
+
+        if ($databaseType === DatabaseType::MONGODB) {
+            $rules['auth_source'] = 'nullable|string|max:255';
+        }
+
+        if ($this->backupsEnabled()) {
+            /** @var DatabaseServer|null $existing */
+            $existing = $this->route('database_server');
+
+            $rules['backups'] = 'required|array|min:1';
+            $rules['backups.*.id'] = ['nullable', 'string', Rule::exists('backups', 'id')->where('database_server_id', $existing?->id)];
+            $rules['backups.*.volume_ids'] = 'required|array|min:1';
+            $rules['backups.*.volume_ids.*'] = ['required', Rule::exists('volumes', 'id')->where('organization_id', app(CurrentOrganization::class)->id())];
+            $rules['backups.*.path'] = ['nullable', 'string', 'max:255', new SafePath];
+            $rules['backups.*.backup_schedule_id'] = 'required|exists:backup_schedules,id';
+            $rules['backups.*.retention_policy'] = 'required|string|in:'.implode(',', Backup::RETENTION_POLICIES);
+            $rules['backups.*.retention_days'] = 'nullable|integer|min:1|max:365';
+            $rules['backups.*.gfs_keep_daily'] = 'nullable|integer|min:0|max:90';
+            $rules['backups.*.gfs_keep_weekly'] = 'nullable|integer|min:0|max:52';
+            $rules['backups.*.gfs_keep_monthly'] = 'nullable|integer|min:0|max:24';
+
+            if ($databaseType?->identifiesDatabasesByPath() ?? false) {
+                $rules['backups.*.database_names'] = 'required|array|min:1';
+                $rules['backups.*.database_names.*'] = [
+                    'required', 'string', 'max:1000',
+                    new SafeDatabasePath(allowBackslashes: $databaseType === DatabaseType::FIREBIRD),
+                ];
+            } elseif ($databaseType !== null && $databaseType !== DatabaseType::REDIS) {
+                $rules['backups.*.database_selection_mode'] = ['required', 'string', Rule::in(array_map(fn (DatabaseSelectionMode $m) => $m->value, DatabaseSelectionMode::cases()))];
+                $rules['backups.*.database_names'] = 'nullable|array';
+                $rules['backups.*.database_names.*'] = ['string', 'max:255', new SafeDatabaseName];
+                $rules['backups.*.database_include_pattern'] = 'nullable|string|max:500';
+            }
+
+            if ($databaseType?->supportsExcludedTables() ?? false) {
+                $rules['backups.*.excluded_tables'] = ['nullable', 'array', 'max:'.ExcludedTableNames::MAX_NAMES];
+                $rules['backups.*.excluded_tables.*'] = ['string', 'max:'.ExcludedTableNames::MAX_NAME_LENGTH, 'regex:'.ExcludedTableNames::PATTERN];
+            }
+        }
+
+        return $rules;
+    }
+
+    public function withValidator(Validator $validator): void
+    {
+        $validator->after(function (Validator $validator) {
+            if (! $this->backupsEnabled()) {
+                return;
+            }
+
+            /** @var DatabaseServer|null $existing */
+            $existing = $this->route('database_server');
+
+            $backups = $this->input('backups', []);
+
+            if (! is_array($backups)) {
+                return;
+            }
+
+            $isAgent = $this->has('agent_id')
+                ? $this->filled('agent_id')
+                : ($existing?->agent_id !== null);
+
+            foreach ($backups as $index => $backup) {
+                $this->validateBackupEntry($validator, $index, is_array($backup) ? $backup : [], $isAgent);
+            }
+        });
+    }
+
+    /**
+     * Whether the saved server will run backups: an omitted flag keeps the
+     * existing server's setting, and a new server defaults to enabled.
+     */
+    private function backupsEnabled(): bool
+    {
+        /** @var DatabaseServer|null $existing */
+        $existing = $this->route('database_server');
+
+        return $this->has('backups_enabled')
+            ? $this->boolean('backups_enabled')
+            : ($existing !== null ? $existing->backups_enabled : true);
+    }
+
+    /**
+     * Per-entry cross-field validation.
+     *
+     * @param  array<string, mixed>  $backup
+     */
+    private function validateBackupEntry(Validator $validator, int $index, array $backup, bool $isAgent): void
+    {
+        if ($isAgent) {
+            $volumeIds = array_filter((array) ($backup['volume_ids'] ?? []));
+            if ($volumeIds !== [] && Volume::whereIn('id', $volumeIds)->where('type', VolumeType::LOCAL->value)->exists()) {
+                $validator->errors()->add("backups.{$index}.volume_ids", 'Local volumes cannot be used with remote agents.');
+            }
+        }
+
+        $retentionPolicy = $backup['retention_policy'] ?? null;
+
+        if ($retentionPolicy === Backup::RETENTION_DAYS && empty($backup['retention_days'])) {
+            $validator->errors()->add("backups.{$index}.retention_days", 'The retention days field is required when using days-based retention.');
+        }
+
+        if ($retentionPolicy === Backup::RETENTION_GFS
+            && empty($backup['gfs_keep_daily'])
+            && empty($backup['gfs_keep_weekly'])
+            && empty($backup['gfs_keep_monthly'])
+        ) {
+            $validator->errors()->add("backups.{$index}.gfs_keep_daily", 'At least one retention tier must be configured.');
+        }
+
+        $mode = $backup['database_selection_mode'] ?? null;
+
+        if ($mode === DatabaseSelectionMode::Selected->value && empty($backup['database_names'])) {
+            $validator->errors()->add("backups.{$index}.database_names", 'At least one database must be selected.');
+        }
+
+        if ($mode === DatabaseSelectionMode::Pattern->value) {
+            $pattern = $backup['database_include_pattern'] ?? '';
+
+            if (! is_string($pattern) || $pattern === '') {
+                $validator->errors()->add("backups.{$index}.database_include_pattern", 'The include pattern is required in pattern selection mode.');
+
+                return;
+            }
+
+            if (! DatabaseServer::isValidDatabasePattern($pattern)) {
+                $validator->errors()->add("backups.{$index}.database_include_pattern", 'The pattern is not a valid regular expression.');
+            }
+        }
+    }
+}

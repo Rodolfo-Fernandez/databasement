@@ -1,0 +1,144 @@
+<?php
+
+/**
+ * Integration tests for DatabaseProvider::testConnectionForServer() with real databases.
+ *
+ * These tests require the database containers (MySQL, PostgreSQL, Redis, MongoDB, MSSQL, Firebird) to be running.
+ * Run with: php artisan test --group=integration
+ */
+
+use App\Enums\DatabaseType;
+use App\Facades\AppConfig;
+use App\Models\DatabaseServer;
+use App\Services\Backup\Databases\DatabaseProvider;
+use Tests\Support\IntegrationTestHelpers;
+
+test('connection succeeds', function (string $databaseType) {
+    $config = IntegrationTestHelpers::getDatabaseConfig($databaseType);
+
+    if ($databaseType === 'sqlite') {
+        IntegrationTestHelpers::createTestSqliteDatabase($config['host']);
+    } elseif (in_array($databaseType, ['mysql', 'mariadb', 'postgres', 'firebird'], true)) {
+        // Create unique database for this parallel process
+        $server = IntegrationTestHelpers::createDatabaseServer($databaseType);
+        IntegrationTestHelpers::loadTestData($databaseType, $server);
+    }
+    // Redis, MongoDB and MSSQL test the connection at server level - no test data needed
+
+    $testServer = DatabaseServer::forConnectionTest([
+        'database_type' => $config['database_type'],
+        'host' => $config['host'],
+        'port' => $config['port'],
+        'username' => $config['username'],
+        'password' => $config['password'],
+        'database_names' => match ($databaseType) {
+            'sqlite' => [$config['host']],
+            'firebird' => [$config['database']],
+            default => null,
+        },
+        'extra_config' => isset($config['auth_source']) ? ['auth_source' => $config['auth_source']] : null,
+    ]);
+
+    $result = app(DatabaseProvider::class)->testConnectionForServer($testServer);
+
+    expect($result['success'])->toBeTrue()
+        ->and($result['message'])->toBe('Connection successful');
+
+    // Cleanup external database
+    if (isset($server)) {
+        IntegrationTestHelpers::dropDatabase($databaseType, $server, $config['database']);
+    }
+})->with([...array_column(DatabaseType::cases(), 'value'), 'mariadb']);
+
+test('connection fails with invalid credentials', function (string $databaseType) {
+    $config = IntegrationTestHelpers::getDatabaseConfig($databaseType);
+
+    $server = DatabaseServer::forConnectionTest([
+        'database_type' => $config['database_type'],
+        'host' => $config['host'],
+        'port' => $config['port'],
+        'username' => 'invalid_user',
+        'password' => 'invalid_password',
+        'database_names' => $databaseType === 'firebird' ? [$config['database']] : null,
+    ]);
+
+    $result = app(DatabaseProvider::class)->testConnectionForServer($server);
+
+    expect($result['success'])->toBeFalse()
+        ->and($result['message'])->not->toBeEmpty();
+})->with(['mysql', 'mariadb', 'postgres', 'firebird']);
+
+test('connection fails with unreachable host', function (string $databaseType, int $port) {
+    $server = DatabaseServer::forConnectionTest([
+        'database_type' => $databaseType,
+        'host' => '127.0.0.1',
+        'port' => $port, // Wrong port - nothing listening here
+        'username' => 'user',
+        'password' => 'password',
+        'database_names' => $databaseType === 'firebird' ? [IntegrationTestHelpers::getDatabaseConfig('firebird')['database']] : null,
+    ]);
+
+    $result = app(DatabaseProvider::class)->testConnectionForServer($server);
+
+    expect($result['success'])->toBeFalse()
+        ->and($result['message'])->not->toBeEmpty();
+})->with([
+    'mysql' => ['mysql', 33061],      // Wrong MySQL port
+    'postgres' => ['postgres', 54321], // Wrong PostgreSQL port
+    'firebird' => ['firebird', 30501], // Wrong Firebird port
+]);
+
+test('sqlite connection fails', function (string $path, string $expectedMessage) {
+    $server = DatabaseServer::forConnectionTest([
+        'database_type' => 'sqlite',
+        'host' => '',
+        'port' => 0,
+        'username' => '',
+        'password' => '',
+        'database_names' => [$path],
+    ]);
+
+    $result = app(DatabaseProvider::class)->testConnectionForServer($server);
+
+    expect($result['success'])->toBeFalse()
+        ->and($result['message'])->toContain($expectedMessage);
+})->with([
+    'non-existent file' => ['/path/to/nonexistent/database.sqlite', 'does not exist'],
+    'empty path' => ['', 'Database path is required'],
+]);
+
+test('sqlite connection fails with invalid sqlite file', function () {
+    $backupDir = AppConfig::get('backup.working_directory');
+    $invalidPath = "{$backupDir}/not_a_sqlite_file.txt";
+
+    file_put_contents($invalidPath, 'This is not a SQLite database');
+
+    $server = DatabaseServer::forConnectionTest([
+        'database_type' => 'sqlite',
+        'host' => '',
+        'port' => 0,
+        'username' => '',
+        'password' => '',
+        'database_names' => [$invalidPath],
+    ]);
+
+    $result = app(DatabaseProvider::class)->testConnectionForServer($server);
+
+    expect($result['success'])->toBeFalse()
+        ->and($result['message'])->toContain('Invalid SQLite database file');
+});
+
+test('redis connection fails with wrong port', function () {
+    $server = DatabaseServer::forConnectionTest([
+        'database_type' => 'redis',
+        'host' => '127.0.0.1',
+        'port' => 63791, // Wrong port
+        'username' => '',
+        'password' => '',
+    ]);
+
+    $result = app(DatabaseProvider::class)->testConnectionForServer($server);
+
+    expect($result['success'])->toBeFalse()
+        ->and($result['message'])->not->toBeEmpty();
+});
